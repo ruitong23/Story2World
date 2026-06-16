@@ -1,0 +1,7 @@
+# Tkinter is included with the standard Windows Python installer.
+chardet>=5.2
+jieba>=0.42
+numpy>=1.26
+openai>=1.30
+rank-bm25>=0.2.2
+sentence-transformers>=3.0

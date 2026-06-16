@@ -1,0 +1,5 @@
+{
+  "llm_base_url": "http://localhost:1234/v1",
+  "llm_model": "gemma-4-26b-a4b-it",
+  "llm_api_key": "lm-studio"
+}
