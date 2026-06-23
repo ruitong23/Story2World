@@ -7,26 +7,33 @@ from pathlib import Path
 
 
 GENERATED_DB_DIR = Path("generated_db")
-WORLD_DB_DIR = GENERATED_DB_DIR / "world"
-CHARACTER_DB_DIR = GENERATED_DB_DIR / "characters"
+GRAPH_DB_DIR = GENERATED_DB_DIR / "graph"
+CANONICAL_DB_DIR = GENERATED_DB_DIR / "canonical"
 AGENT_DB_DIR = GENERATED_DB_DIR / "agents"
+RUNTIME_DB_DIR = GENERATED_DB_DIR / "runtime"
 
 
-WORLD_FILES = [
+GRAPH_FILES = [
     "novel_ontology.json",
     "raw_graph_triples.json",
     "normalized_graph_triples.json",
     "structured_world_graph.json",
-    "world_db.json",
-    "canonical_novel_db.json",
-    "simulation_state_db.json",
-    "runtime_event_db.json",
     "mention_weak_relations.json",
-    "canonical_relationships_db.json",
-    "relationship_arc_db.json",
 ]
 
-CHARACTER_FILES = [
+CANONICAL_FILES = [
+    "world_db.json",
+    "canonical_timeline_db.json",
+    "canonical_event_db.json",
+    "canonical_character_db.json",
+    "canonical_relationship_db.json",
+    "canonical_ability_db.json",
+    "canonical_item_db.json",
+    "canonical_organization_db.json",
+    "canonical_location_db.json",
+    "canonical_world_rule_db.json",
+    "canonical_knowledge_db.json",
+    "relationship_arc_db.json",
     "mention_alias_index.json",
     "canonical_entities.json",
     "character_state_db.json",
@@ -34,23 +41,38 @@ CHARACTER_FILES = [
 
 AGENT_FILES = [
     "agent_profiles.json",
+    "runtime_agent_state.json",
+]
+
+RUNTIME_FILES = [
+    "simulation_state_template.json",
+    "runtime_event_db.json",
+    "runtime_relationship_db.json",
+    "runtime_log.json",
 ]
 
 
 def generated_path(group, filename, base_dir=Path(".")):
     base_dir = Path(base_dir)
-    if group == "world":
-        return base_dir / WORLD_DB_DIR / filename
-    if group == "characters":
-        return base_dir / CHARACTER_DB_DIR / filename
+    if group == "graph":
+        return base_dir / GRAPH_DB_DIR / filename
+    if group == "canonical":
+        return base_dir / CANONICAL_DB_DIR / filename
     if group == "agents":
         return base_dir / AGENT_DB_DIR / filename
+    if group == "runtime":
+        return base_dir / RUNTIME_DB_DIR / filename
+    # Compatibility for older callers. New code should use graph/canonical/runtime.
+    if group == "world":
+        return base_dir / CANONICAL_DB_DIR / filename
+    if group == "characters":
+        return base_dir / CANONICAL_DB_DIR / filename
     raise ValueError(f"Unknown generated DB group: {group}")
 
 
 def ensure_generated_dirs(base_dir=Path(".")):
     base_dir = Path(base_dir)
-    for directory in (WORLD_DB_DIR, CHARACTER_DB_DIR, AGENT_DB_DIR):
+    for directory in (GRAPH_DB_DIR, CANONICAL_DB_DIR, AGENT_DB_DIR, RUNTIME_DB_DIR):
         (base_dir / directory).mkdir(parents=True, exist_ok=True)
 
 
@@ -59,9 +81,10 @@ def publish_generated_databases(base_dir=Path(".")):
     ensure_generated_dirs(base_dir)
     published = {}
     for group, filenames in (
-        ("world", WORLD_FILES),
-        ("characters", CHARACTER_FILES),
+        ("graph", GRAPH_FILES),
+        ("canonical", CANONICAL_FILES),
         ("agents", AGENT_FILES),
+        ("runtime", RUNTIME_FILES),
     ):
         for filename in filenames:
             source = base_dir / filename

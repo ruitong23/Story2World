@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from world_state_layers import (
+    build_runtime_agent_state,
     build_runtime_event_db,
+    build_runtime_log,
+    build_runtime_relationship_db,
     build_simulation_state_db,
     load_layer_sidecars,
 )
@@ -174,13 +177,19 @@ class SimulationStore:
         self.agent_fingerprint = agent_profiles.get(
             "agent_profile_db_fingerprint"
         ) or stable_hash(agent_profiles)
+        self.runtime_dir = self.path.parent
+        self.agents_dir = self.runtime_dir.parent / "agents"
         self.state = self._load_or_create()
+        self._refresh_runtime_sidecars()
+        self._sync_sidecar_files()
+
+    def _simulation_template(self):
+        return self.world_db.get("simulation_state_template") or self.world_db.get(
+            "simulation_state_db", {}
+        )
 
     def _base_entity_states(self):
-        layered_state = (
-            self.world_db.get("simulation_state_db", {})
-            .get("current_world_state", {})
-        )
+        layered_state = self._simulation_template().get("current_world_state", {})
         if layered_state.get("entity_states"):
             result = deep_copy(layered_state.get("entity_states", {}))
             for character in self.character_db.get("characters", []):
@@ -216,21 +225,13 @@ class SimulationStore:
         return result
 
     def _base_resource_states(self):
-        layered_state = (
-            self.world_db.get("simulation_state_db", {})
-            .get("current_world_state", {})
-        )
+        layered_state = self._simulation_template().get("current_world_state", {})
         return deep_copy(layered_state.get("resource_states", {}))
 
     def _base_relationship_states(self):
-        layered_state = (
-            self.world_db.get("simulation_state_db", {})
-            .get("current_world_state", {})
-        )
+        layered_state = self._simulation_template().get("current_world_state", {})
         states = deep_copy(layered_state.get("relationship_states", {}))
-        cutoff_order = self.world_db.get("simulation_state_db", {}).get(
-            "cutoff_order"
-        )
+        cutoff_order = self._simulation_template().get("cutoff_order")
         arc_db = (
             self.world_db.get("relationship_arc_db")
             or self.world_db.get("relationship_system", {}).get(
@@ -271,14 +272,34 @@ class SimulationStore:
         return states
 
     def _base_identity_states(self):
-        layered_state = (
-            self.world_db.get("simulation_state_db", {})
-            .get("current_world_state", {})
-        )
+        layered_state = self._simulation_template().get("current_world_state", {})
         return deep_copy(layered_state.get("identity_states", {}))
 
     def _base_runtime_events(self):
         return deep_copy(self.world_db.get("runtime_event_db", {}))
+
+    def _base_runtime_relationship_db(self):
+        if self.world_db.get("runtime_relationship_db"):
+            return deep_copy(self.world_db["runtime_relationship_db"])
+        return build_runtime_relationship_db(
+            self._simulation_template(),
+            self.world_db.get("canonical_relationship_db", {}),
+        )
+
+    def _base_runtime_agent_state(self):
+        return build_runtime_agent_state(
+            self.agent_profiles,
+            self._simulation_template(),
+            self._base_runtime_relationship_db(),
+        )
+
+    def _base_runtime_log(self):
+        if self.world_db.get("runtime_log"):
+            return deep_copy(self.world_db["runtime_log"])
+        return build_runtime_log(
+            self._simulation_template(),
+            self._base_runtime_events(),
+        )
 
     def _base_ownership(self):
         ownership = {}
@@ -361,6 +382,9 @@ class SimulationStore:
             "runtime_event_queue": self._base_runtime_events().get(
                 "event_queue", []
             ),
+            "runtime_relationship_db": self._base_runtime_relationship_db(),
+            "runtime_agent_state": self._base_runtime_agent_state(),
+            "runtime_log": self._base_runtime_log(),
             "canonical_timeline": [],
             "timeline_cursor": 0,
             "branch_records": [],
@@ -431,6 +455,9 @@ class SimulationStore:
                     "identity_states",
                     "runtime_event_db",
                     "runtime_event_queue",
+                    "runtime_relationship_db",
+                    "runtime_agent_state",
+                    "runtime_log",
                     "canonical_timeline",
                     "timeline_cursor",
                     "branch_records",
@@ -452,9 +479,139 @@ class SimulationStore:
     def runtime(self):
         return self.branch["runtime"]
 
+    def _runtime_as_template(self):
+        template = deep_copy(self._simulation_template())
+        template.setdefault("current_world_state", {})
+        template["current_world_state"].update(
+            {
+                "entity_states": deep_copy(self.runtime.get("entity_states", {})),
+                "resource_states": deep_copy(self.runtime.get("resource_states", {})),
+                "identity_states": deep_copy(self.runtime.get("identity_states", {})),
+                "relationship_states": deep_copy(
+                    self.runtime.get("relationship_states", {})
+                ),
+                "state_revision": self.branch.get("head_revision", 0),
+                "branch_id": self.branch.get("branch_id", "main"),
+            }
+        )
+        return template
+
+    def _refresh_runtime_sidecars(self, committed_event=None):
+        runtime_template = self._runtime_as_template()
+        relationship_db = build_runtime_relationship_db(
+            runtime_template,
+            self.world_db.get("canonical_relationship_db", {}),
+        )
+        relationship_db["change_log"] = deep_copy(
+            self.runtime.get("runtime_relationship_db", {}).get("change_log", [])
+        )
+        if committed_event:
+            for patch in committed_event.get("patches", []):
+                if patch.get("field") == "relationship":
+                    relationship_db["change_log"].append(
+                        {
+                            "event_id": committed_event["event_id"],
+                            "revision": committed_event["revision_after"],
+                            "patch": deep_copy(patch),
+                        }
+                    )
+        self.runtime["runtime_relationship_db"] = relationship_db
+
+        event_db = deep_copy(self.runtime.get("runtime_event_db", {}))
+        if committed_event:
+            event_db.setdefault("runtime_committed_events", []).append(
+                {
+                    "event_id": committed_event["event_id"],
+                    "event_type": committed_event.get("event_type"),
+                    "revision": committed_event["revision_after"],
+                    "participants": committed_event.get("participants", []),
+                    "state_change_count": len(committed_event.get("patches", [])),
+                    "created_at": committed_event.get("created_at", utc_now()),
+                }
+            )
+            for queued in event_db.get("event_queue", []):
+                if queued.get("runtime_event_id") == committed_event.get(
+                    "runtime_event_id"
+                ) or queued.get("canonical_event_id") == committed_event.get(
+                    "canonical_event_id"
+                ):
+                    queued["status"] = "completed"
+                    queued["queue_status"] = "completed"
+                    queued["committed_at_revision"] = committed_event[
+                        "revision_after"
+                    ]
+        event_db["completed_event_ids"] = [
+            item.get("runtime_event_id")
+            for item in event_db.get("event_queue", [])
+            if item.get("queue_status") == "completed"
+        ]
+        event_db["waiting_trigger_event_ids"] = [
+            item.get("runtime_event_id")
+            for item in event_db.get("event_queue", [])
+            if item.get("queue_status") == "waiting_trigger"
+        ]
+        event_db["active_event_ids"] = [
+            item.get("runtime_event_id")
+            for item in event_db.get("event_queue", [])
+            if item.get("queue_status") == "active"
+        ]
+        self.runtime["runtime_event_db"] = event_db
+        self.runtime["runtime_event_queue"] = deep_copy(
+            event_db.get("event_queue", [])
+        )
+
+        self.runtime["runtime_agent_state"] = build_runtime_agent_state(
+            self.agent_profiles,
+            runtime_template,
+            relationship_db,
+        )
+
+        runtime_log = deep_copy(self.runtime.get("runtime_log") or {})
+        runtime_log.setdefault("schema_version", STEP17_SCHEMA_VERSION)
+        runtime_log.setdefault("layer", "Runtime Log")
+        runtime_log.setdefault("entries", [])
+        if committed_event:
+            runtime_log["entries"].append(
+                {
+                    "log_id": "log_" + committed_event["event_id"],
+                    "entry_type": committed_event.get("event_type", "runtime_event"),
+                    "event_id": committed_event["event_id"],
+                    "revision": committed_event["revision_after"],
+                    "branch_id": self.branch.get("branch_id"),
+                    "participants": committed_event.get("participants", []),
+                    "state_change_count": len(committed_event.get("patches", [])),
+                    "created_at": committed_event.get("created_at", utc_now()),
+                }
+            )
+        self.runtime["runtime_log"] = runtime_log
+
+    def _sync_sidecar_files(self):
+        if not self.runtime_dir:
+            return
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.agents_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            self.runtime_dir / "runtime_event_db.json",
+            self.runtime.get("runtime_event_db", {}),
+        )
+        atomic_write_json(
+            self.runtime_dir / "runtime_relationship_db.json",
+            self.runtime.get("runtime_relationship_db", {}),
+        )
+        atomic_write_json(
+            self.runtime_dir / "runtime_log.json",
+            self.runtime.get("runtime_log", {}),
+        )
+        atomic_write_json(
+            self.agents_dir / "runtime_agent_state.json",
+            self.runtime.get("runtime_agent_state", {}),
+        )
+
     def save(self):
+        self._refresh_runtime_sidecars()
         self.state["updated_at"] = utc_now()
         atomic_write_json(self.path, self.state)
+        self._sync_sidecar_files()
 
     def reset(self):
         self.state = self._new_state()
@@ -898,6 +1055,7 @@ class SimulationStore:
                 "created_at": utc_now(),
             }
         )
+        self._refresh_runtime_sidecars(committed)
         self.save()
         return {
             "status": "committed",
@@ -3926,17 +4084,32 @@ def load_step17_runtime(
     world_path = Path(world_path)
     world_db = json.loads(world_path.read_text(encoding="utf-8"))
     world_db = load_layer_sidecars(world_db, world_path.parent)
+    generated_root = world_path.parent.parent
+    runtime_dir = generated_root / "runtime"
+    if runtime_dir.is_dir():
+        world_db = load_layer_sidecars(world_db, runtime_dir)
     for filename, key in (
+        ("canonical_relationship_db.json", "canonical_relationship_db"),
         ("canonical_relationships_db.json", "canonical_relationships_db"),
         ("relationship_arc_db.json", "relationship_arc_db"),
+        ("runtime_event_db.json", "runtime_event_db"),
+        ("runtime_relationship_db.json", "runtime_relationship_db"),
+        ("runtime_log.json", "runtime_log"),
     ):
-        sidecar = world_path.parent / filename
-        if key not in world_db and sidecar.is_file():
-            world_db[key] = json.loads(sidecar.read_text(encoding="utf-8"))
+        for sidecar_dir in (world_path.parent, runtime_dir):
+            sidecar = sidecar_dir / filename
+            if key not in world_db and sidecar.is_file():
+                world_db[key] = json.loads(sidecar.read_text(encoding="utf-8"))
+                break
     if "relationship_system" not in world_db and (
-        "canonical_relationships_db" in world_db or "relationship_arc_db" in world_db
+        "canonical_relationship_db" in world_db
+        or "canonical_relationships_db" in world_db
+        or "relationship_arc_db" in world_db
     ):
         world_db["relationship_system"] = {
+            "canonical_relationship_db": world_db.get(
+                "canonical_relationship_db", {}
+            ),
             "canonical_relationships_db": world_db.get(
                 "canonical_relationships_db", {}
             ),

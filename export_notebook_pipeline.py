@@ -34,6 +34,12 @@ def _parse_arguments():
     parser.add_argument("--percent", type=float, default=100.0)
     parser.add_argument("--chunk-size", type=int, default=2000)
     parser.add_argument("--overlap", type=int, default=300)
+    parser.add_argument(
+        "--chunk-limit",
+        type=int,
+        default=30,
+        help="Maximum Step 9 chunks to process. Use 0 for all selected chunks.",
+    )
     return parser.parse_args()
 
 
@@ -110,24 +116,36 @@ emit_progress(6, f"Built {len(chunks)} chunks")
 '''
 
 
+CUSTOM_SOURCE_LOADER = r'''
+from novel_text_io import detect_encoding, read_novel_txt
+'''
+
+
 CUSTOM_STEP9_OVERRIDE = r'''
 if not 0 < ARGS.percent <= 100:
     raise ValueError("--percent must be greater than 0 and at most 100.")
-STEP9_CHUNK_LIMIT = max(
+STEP9_PERCENT_CHUNK_LIMIT = max(
     1,
     math.ceil(len(project_data["chunks"]) * ARGS.percent / 100.0),
 )
+if not ARGS.chunk_limit:
+    STEP9_CHUNK_LIMIT = STEP9_PERCENT_CHUNK_LIMIT
+else:
+    STEP9_CHUNK_LIMIT = max(
+        1,
+        min(STEP9_PERCENT_CHUNK_LIMIT, ARGS.chunk_limit),
+    )
 STEP9_FORCE_REBUILD = False
 print(
     f"Selected {STEP9_CHUNK_LIMIT}/{len(project_data['chunks'])} chunks "
-    f"({ARGS.percent:g}% requested)."
+    f"({ARGS.percent:g}% requested, chunk limit={ARGS.chunk_limit})."
 )
 emit_progress(9, "Starting graph extraction")
 '''
 
 
 CELL_SEQUENCE = [
-    ("cell", 0),
+    ("text", CUSTOM_SOURCE_LOADER),
     ("cell", 1),
     ("text", CUSTOM_PROJECT_INIT),
     ("cell", 4),

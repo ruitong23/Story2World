@@ -882,10 +882,11 @@ def build_simulation_state_db(canonical_db, cutoff_order=None, existing_world_st
 
     state_db = {
         "schema_version": LAYER_SCHEMA_VERSION,
-        "layer": "Simulation State DB",
+        "layer": "Simulation State Template",
         "purpose": (
             "Mutable baseline produced by cutting the canonical trajectory at "
-            "a chosen timepoint; contains only happened/owned/known/established state."
+            "a chosen timepoint; contains only happened/owned/known/established state. "
+            "The live save is runtime/simulation_state.json."
         ),
         "source_canonical_db_fingerprint": canonical_db.get(
             "canonical_db_fingerprint"
@@ -927,7 +928,473 @@ def build_simulation_state_db(canonical_db, cutoff_order=None, existing_world_st
             if key != "simulation_state_db_fingerprint"
         }
     )
+    state_db["simulation_state_template_fingerprint"] = state_db[
+        "simulation_state_db_fingerprint"
+    ]
     return state_db
+
+
+def state_change_refs_for_event(event, canonical_db):
+    event_id = event.get("event_id")
+    order = event.get("order_key")
+    participants = {
+        item.get("entity_id") if isinstance(item, dict) else item
+        for item in event.get("participants", [])
+    }
+    participants = {item for item in participants if item}
+    state_refs = {
+        "relationship_change_refs": [],
+        "ability_change_refs": [],
+        "item_change_refs": [],
+        "identity_change_refs": [],
+        "organization_change_refs": [],
+        "knowledge_change_refs": [],
+    }
+    for relation in canonical_db.get("relationship_development_lines", []):
+        if relation.get("order_key") == order or (
+            participants
+            and participants
+            & {relation.get("source_entity_id"), relation.get("target_entity_id")}
+        ):
+            state_refs["relationship_change_refs"].append(relation.get("relation_id"))
+    for resource_id, resource in canonical_db.get("resources", {}).items():
+        if resource.get("first_acquisition_order") == order:
+            key = {
+                "ability": "ability_change_refs",
+                "artifact": "item_change_refs",
+                "identity": "identity_change_refs",
+                "relationship": "relationship_change_refs",
+            }.get(resource.get("resource_type"), "knowledge_change_refs")
+            state_refs[key].append(resource_id)
+    for change in canonical_db.get("organization_changes", []):
+        if change.get("order_key") == order:
+            state_refs["organization_change_refs"].append(change.get("relation_id"))
+    for key, values in state_refs.items():
+        state_refs[key] = unique(values)
+    state_refs["event_id"] = event_id
+    return state_refs
+
+
+def generic_blocked_consequences(event, state_refs):
+    consequences = []
+    for key, label in (
+        ("relationship_change_refs", "relationship changes"),
+        ("ability_change_refs", "ability unlocks or upgrades"),
+        ("item_change_refs", "item transfers or acquisitions"),
+        ("identity_change_refs", "identity/title changes"),
+        ("organization_change_refs", "organization membership/authority changes"),
+        ("knowledge_change_refs", "knowledge exposure"),
+    ):
+        if state_refs.get(key):
+            consequences.append(
+                {
+                    "consequence_type": key.replace("_refs", ""),
+                    "description": (
+                        f"Canonical {label} linked to this event are not applied "
+                        "unless a runtime event independently re-establishes them."
+                    ),
+                    "affected_refs": state_refs[key],
+                }
+            )
+    if not consequences:
+        consequences.append(
+            {
+                "consequence_type": "timeline_branch",
+                "description": (
+                    "Blocking this canonical event leaves future dependent events "
+                    "eligible only after runtime preconditions are revalidated."
+                ),
+                "affected_refs": [event.get("event_id")],
+            }
+        )
+    return consequences
+
+
+def alternative_hooks(event, state_refs):
+    hooks = [
+        {
+            "hook_type": "alternative_scene",
+            "description": (
+                "If the canonical event is blocked, the runtime may create a new "
+                "scene that satisfies equivalent state, relationship, location, "
+                "knowledge, or organization conditions."
+            ),
+            "inherits_canonical_outcome": False,
+            "required_checks": [
+                "current_world_state",
+                "agent_visibility",
+                "dependency_graph",
+                "acquisition_system",
+                "relationship_runtime_state",
+            ],
+        }
+    ]
+    if event.get("participants"):
+        hooks.append(
+            {
+                "hook_type": "participant_replacement_or_delay",
+                "description": (
+                    "Participants may change, arrive late, refuse, or act differently; "
+                    "the event must be revalidated against runtime state."
+                ),
+                "canonical_participants": event.get("participants", []),
+            }
+        )
+    if event.get("locations"):
+        hooks.append(
+            {
+                "hook_type": "location_variant",
+                "description": (
+                    "A different location can host a variant only if local rules, "
+                    "access, witnesses, and available objects support it."
+                ),
+                "canonical_locations": event.get("locations", []),
+            }
+        )
+    if any(state_refs.get(key) for key in ("ability_change_refs", "item_change_refs")):
+        hooks.append(
+            {
+                "hook_type": "resource_opportunity",
+                "description": (
+                    "Abilities or items may be obtained by another qualified actor "
+                    "if that actor triggers the opportunity and passes all conditions."
+                ),
+                "affected_resources": unique(
+                    state_refs.get("ability_change_refs", [])
+                    + state_refs.get("item_change_refs", [])
+                ),
+            }
+        )
+    return hooks
+
+
+def canonical_event_record(event, canonical_db):
+    state_refs = state_change_refs_for_event(event, canonical_db)
+    order = event.get("order_key")
+    return {
+        "event_id": event.get("event_id"),
+        "canonical_name": event.get("canonical_name", ""),
+        "event_type": event.get("event_type", "event"),
+        "canonical_order": order,
+        "status_in_source": event.get("status", "unknown"),
+        "participants": event.get("participants", []),
+        "locations": event.get("locations", []),
+        "preconditions": event.get("preconditions", []),
+        "trigger_conditions": event.get("preconditions", []),
+        "state_changes": event.get("state_changes", []),
+        "outcomes": event.get("outcomes", []),
+        "caused_by": event.get("caused_by", []),
+        "unlocks_next_events": [],
+        "relationship_change_refs": state_refs["relationship_change_refs"],
+        "ability_change_refs": state_refs["ability_change_refs"],
+        "item_change_refs": state_refs["item_change_refs"],
+        "identity_change_refs": state_refs["identity_change_refs"],
+        "organization_change_refs": state_refs["organization_change_refs"],
+        "knowledge_change_refs": state_refs["knowledge_change_refs"],
+        "can_be_blocked": True,
+        "can_be_altered": True,
+        "blocked_consequences": generic_blocked_consequences(event, state_refs),
+        "alternative_runtime_hooks": alternative_hooks(event, state_refs),
+        "source_chunk_ids": event.get("source_chunk_ids", []),
+        "evidence_refs": event.get("evidence_refs", []),
+    }
+
+
+def relationship_dimensions(relation_type, evidence_kind=""):
+    dims = {
+        "knows_each_other": 0,
+        "familiarity": 0,
+        "trust": 0,
+        "respect": 0,
+        "affection": 0,
+        "hostility": 0,
+        "authority": 0,
+        "debt": 0,
+        "shared_history": 0,
+        "visibility": 0,
+    }
+    relation_type = str(relation_type or "")
+    if relation_type.startswith("CO_") or evidence_kind in {
+        "same_scene",
+        "shared_event",
+        "shared_location",
+        "shared_artifact",
+    }:
+        dims.update({"knows_each_other": 1, "familiarity": 1, "visibility": 1})
+    if relation_type in {"COMPANION_OF", "HAS_RELATIONSHIP", "SEEKS_HELP_FROM"}:
+        dims.update({"trust": 1, "familiarity": 1, "shared_history": 1})
+    if relation_type in {"CHILD_OF", "PARENT_OF", "DISCIPLE_OF"}:
+        dims.update({"authority": 1, "trust": 1, "shared_history": 1})
+    if relation_type in {"FIGHTS_WITH", "HAS_CONFLICT_WITH", "OPPOSES", "OFFENDS"}:
+        dims.update({"hostility": 1, "visibility": 1})
+    return dims
+
+
+def build_canonical_component_dbs(canonical_db, world_db=None):
+    world_db = world_db or {}
+    events = [
+        canonical_event_record(event, canonical_db)
+        for event in canonical_db.get("event_chain", [])
+    ]
+    events_by_id = {event["event_id"]: event for event in events if event.get("event_id")}
+    ordered_event_ids = [
+        event["event_id"]
+        for event in sorted(
+            events,
+            key=lambda item: (
+                item.get("canonical_order") is None,
+                item.get("canonical_order")
+                if item.get("canonical_order") is not None
+                else 10**12,
+                item.get("event_id", ""),
+            ),
+        )
+        if event.get("event_id")
+    ]
+    timeline_nodes = [
+        {
+            "timeline_node_id": "timeline_" + event_id,
+            "canonical_order": events_by_id[event_id].get("canonical_order"),
+            "event_id": event_id,
+            "event_ref": {"db": "canonical_event_db", "event_id": event_id},
+            "branchable": True,
+            "can_be_blocked": True,
+            "can_be_altered": True,
+            "state_change_refs": {
+                key: events_by_id[event_id].get(key, [])
+                for key in (
+                    "relationship_change_refs",
+                    "ability_change_refs",
+                    "item_change_refs",
+                    "identity_change_refs",
+                    "organization_change_refs",
+                    "knowledge_change_refs",
+                )
+            },
+        }
+        for event_id in ordered_event_ids
+    ]
+
+    canonical_relationship_source = world_db.get("canonical_relationship_db") or world_db.get(
+        "canonical_relationships_db", {}
+    )
+    relationship_arcs = world_db.get("relationship_arc_db", {}).get(
+        "relationship_arcs", []
+    )
+    canonical_relationships = []
+    for relation in canonical_relationship_source.get("relationships", []):
+        first_order = None
+        orders = []
+        for evidence in relation.get("evidence", []):
+            try:
+                orders.append(int(evidence.get("source_chunk_id")))
+            except (TypeError, ValueError):
+                pass
+        if orders:
+            first_order = min(orders)
+        dims = relationship_dimensions(
+            relation.get("relationship_type"),
+            (relation.get("evidence") or [{}])[0].get("evidence_kind", ""),
+        )
+        canonical_relationships.append(
+            {
+                "canonical_relationship_id": relation.get(
+                    "canonical_relationship_id"
+                ),
+                "source_entity_id": relation.get("source_entity_id"),
+                "target_entity_id": relation.get("target_entity_id"),
+                "participant_ids": unique(
+                    [
+                        relation.get("source_entity_id"),
+                        relation.get("target_entity_id"),
+                    ]
+                ),
+                "source_name": relation.get("source_name", ""),
+                "target_name": relation.get("target_name", ""),
+                "relationship_type": relation.get("relationship_type", ""),
+                "relationship_origin": (
+                    "normalized_weak_relation"
+                    if not relation.get("final_relationship")
+                    else "canonical_evidence"
+                ),
+                "first_seen_order": first_order,
+                "dimension_seed": dims,
+                "evidence": relation.get("evidence", []),
+                "source_chunk_ids": relation.get("source_chunk_ids", []),
+                "runtime_policy": {
+                    "not_final_label": True,
+                    "changes_require_event": True,
+                    "different_paths_can_produce_different_dimensions": True,
+                },
+            }
+        )
+
+    character_records = []
+    for entity_id, entity in canonical_db.get("entity_tracks", {}).items():
+        if entity.get("entity_type") != "Character":
+            continue
+        growth = canonical_db.get("character_growth_lines", {}).get(entity_id, {})
+        character_records.append(
+            {
+                "character_id": entity_id,
+                "entity_id": entity_id,
+                "canonical_name": entity.get("canonical_name", ""),
+                "aliases": entity.get("aliases", []),
+                "titles": entity.get("titles", []),
+                "forms": entity.get("forms", []),
+                "first_seen_order": entity.get("first_seen_order"),
+                "template_only": True,
+                "growth_fact_refs": [
+                    item.get("occurrence_id")
+                    for item in growth.get("growth_facts", [])
+                    if item.get("occurrence_id")
+                ],
+                "ability_resource_ids": growth.get("ability_resource_ids", []),
+                "artifact_resource_ids": growth.get("artifact_resource_ids", []),
+                "identity_resource_ids": growth.get("identity_resource_ids", []),
+                "evidence_refs": entity.get("evidence_refs", []),
+            }
+        )
+
+    def resource_db(resource_type, layer_name, purpose):
+        resources = {
+            resource_id: resource
+            for resource_id, resource in canonical_db.get("resources", {}).items()
+            if resource.get("resource_type") == resource_type
+        }
+        return {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": layer_name,
+            "purpose": purpose,
+            "resources": resources,
+            "dependency_graph_refs": [
+                "dep_" + resource_id for resource_id in resources
+            ],
+            "policy": {
+                "original_owner_is_not_runtime_owner": True,
+                "access_type_controls_acquisition_attempts": True,
+                "all_changes_require_runtime_event": True,
+            },
+        }
+
+    organization_records = {
+        entity_id: entity
+        for entity_id, entity in canonical_db.get("entity_tracks", {}).items()
+        if entity.get("entity_type") == "Organization"
+    }
+    location_records = {
+        entity_id: entity
+        for entity_id, entity in canonical_db.get("entity_tracks", {}).items()
+        if entity.get("entity_type") == "Location"
+    }
+    knowledge_units = world_db.get("knowledge_units", [])
+    component_dbs = {
+        "canonical_timeline_db": {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": "Canonical Timeline DB",
+            "purpose": "Read-only default source trajectory and event references.",
+            "source_canonical_db_fingerprint": canonical_db.get(
+                "canonical_db_fingerprint"
+            ),
+            "ordered_event_ids": ordered_event_ids,
+            "timeline_nodes": timeline_nodes,
+            "policy": {
+                "timeline_is_default_route_not_destiny": True,
+                "cutoff_selects_checkpoint_only": True,
+                "future_events_require_runtime_preconditions": True,
+            },
+        },
+        "canonical_event_db": {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": "Canonical Event DB",
+            "purpose": "Read-only canonical events with runtime trigger hooks.",
+            "events": events_by_id,
+            "event_order": ordered_event_ids,
+            "policy": {
+                "canonical_event_can_be_blocked": True,
+                "blocked_events_do_not_apply_state_changes": True,
+                "alternative_hooks_enable_branching": True,
+            },
+        },
+        "canonical_character_db": {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": "Canonical Character DB",
+            "purpose": "Canonical character templates and growth references, not runtime state.",
+            "characters": character_records,
+            "character_by_id": {item["character_id"]: item for item in character_records},
+            "policy": {
+                "template_only": True,
+                "runtime_state_lives_in_agents_runtime_agent_state_and_runtime_simulation_state": True,
+            },
+        },
+        "canonical_relationship_db": {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": "Canonical Relationship DB",
+            "purpose": "Event-evidence relationship arcs; not final relationship truth.",
+            "relationships": canonical_relationships,
+            "relationship_arcs": relationship_arcs,
+            "policy": {
+                "mention_weak_relations_are_resolver_evidence": True,
+                "runtime_relationships_are_event_sourced": True,
+                "relationship_dimensions_not_static_labels": True,
+            },
+        },
+        "canonical_ability_db": resource_db(
+            "ability",
+            "Canonical Ability DB",
+            "Ability definitions, dependency conditions and original users.",
+        ),
+        "canonical_item_db": resource_db(
+            "artifact",
+            "Canonical Item DB",
+            "Item/artifact definitions, transfer conditions and original holders.",
+        ),
+        "canonical_organization_db": {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": "Canonical Organization DB",
+            "purpose": "Canonical organizations and organization-change evidence.",
+            "organizations": organization_records,
+            "organization_changes": canonical_db.get("organization_changes", []),
+            "policy": {"membership_changes_require_runtime_event": True},
+        },
+        "canonical_location_db": {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": "Canonical Location DB",
+            "purpose": "Canonical locations and source event references.",
+            "locations": location_records,
+            "event_location_refs": [
+                {
+                    "event_id": event.get("event_id"),
+                    "locations": event.get("locations", []),
+                    "canonical_order": event.get("canonical_order"),
+                }
+                for event in events
+            ],
+        },
+        "canonical_world_rule_db": {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": "Canonical World Rule DB",
+            "purpose": "World rules used by runtime validation.",
+            "rules": canonical_db.get("world_rules", []),
+            "rule_engine": world_db.get("rule_engine", {}),
+            "policy": {"rules_apply_to_runtime_even_when_plot_branches": True},
+        },
+        "canonical_knowledge_db": {
+            "schema_version": LAYER_SCHEMA_VERSION,
+            "layer": "Canonical Knowledge DB",
+            "purpose": "Knowledge units and scopes; runtime visibility is separate.",
+            "knowledge_units": knowledge_units,
+            "knowledge_scope_system": world_db.get("knowledge_scope_system", []),
+            "policy": {
+                "knowledge_exists_in_canon_but_agent_visibility_requires_runtime_scope": True
+            },
+        },
+    }
+    for db in component_dbs.values():
+        db["db_fingerprint"] = stable_json_hash(
+            {key: value for key, value in db.items() if key != "db_fingerprint"}
+        )
+    return component_dbs
 
 
 def build_runtime_event_db(canonical_db, simulation_state_db):
@@ -947,14 +1414,26 @@ def build_runtime_event_db(canonical_db, simulation_state_db):
             {
                 "runtime_event_id": "runtime_" + event["event_id"],
                 "canonical_event_id": event["event_id"],
+                "source_type": "canonical",
                 "event_type": event.get("event_type", "canonical_event"),
                 "canonical_name": event.get("canonical_name", ""),
+                "status": status,
                 "queue_status": status,
                 "scheduled_order": order,
+                "preconditions": event.get("preconditions", []),
                 "trigger_conditions": event.get("preconditions", []),
                 "participants": event.get("participants", []),
                 "locations": event.get("locations", []),
                 "state_changes": event.get("state_changes", []),
+                "blocked_reason": "",
+                "blocked_consequences": generic_blocked_consequences(
+                    event, state_change_refs_for_event(event, canonical_db)
+                ),
+                "alternative_runtime_hooks": alternative_hooks(
+                    event, state_change_refs_for_event(event, canonical_db)
+                ),
+                "committed_at_revision": None,
+                "created_by": "canonical_timeline_import",
                 "can_be_altered_or_blocked": True,
                 "source": "canonical_event_chain",
             }
@@ -972,15 +1451,45 @@ def build_runtime_event_db(canonical_db, simulation_state_db):
             {
                 "runtime_event_id": "runtime_acquire_" + resource_id,
                 "canonical_event_id": None,
+                "source_type": "runtime_opportunity",
                 "event_type": "resource_acquisition_opportunity",
                 "canonical_name": resource.get("canonical_name", resource_id),
                 "resource_id": resource_id,
+                "status": "waiting_trigger",
                 "queue_status": "waiting_trigger",
                 "scheduled_order": resource.get("first_acquisition_order"),
+                "preconditions": resource.get("conditions", {}).get(
+                    "acquisition_conditions", []
+                ),
                 "trigger_conditions": resource.get("conditions", {}).get(
                     "acquisition_conditions", []
                 ),
                 "participants": resource.get("canonical_owner_ids", []),
+                "locations": [],
+                "state_changes": [],
+                "blocked_reason": "",
+                "blocked_consequences": [
+                    {
+                        "consequence_type": "resource_not_granted",
+                        "description": (
+                            "The resource remains unowned or with its current runtime "
+                            "holder until another valid acquisition event commits."
+                        ),
+                        "affected_refs": [resource_id],
+                    }
+                ],
+                "alternative_runtime_hooks": [
+                    {
+                        "hook_type": "alternate_acquisition_path",
+                        "description": (
+                            "Any qualified actor may attempt this resource if the "
+                            "dependency and acquisition conditions pass."
+                        ),
+                        "access_type": resource.get("access_type", "open"),
+                    }
+                ],
+                "committed_at_revision": None,
+                "created_by": "acquisition_system",
                 "can_be_altered_or_blocked": True,
                 "source": "acquisition_system",
             }
@@ -1032,23 +1541,200 @@ def build_runtime_event_db(canonical_db, simulation_state_db):
     return runtime_db
 
 
+def build_runtime_relationship_db(simulation_state_db, canonical_relationship_db=None):
+    canonical_relationship_db = canonical_relationship_db or {}
+    current = simulation_state_db.get("current_world_state", {})
+    relationships = {}
+    canonical_by_pair = {}
+    for relation in canonical_relationship_db.get("relationships", []):
+        pair = tuple(sorted(relation.get("participant_ids", [])))
+        canonical_by_pair.setdefault(pair, []).append(relation)
+    for rel_id, state in current.get("relationship_states", {}).items():
+        pair = tuple(sorted(state.get("participant_ids", [])))
+        seeds = canonical_by_pair.get(pair, [])
+        dims = {
+            "knows_each_other": 1,
+            "familiarity": 1,
+            "trust": 0,
+            "respect": 0,
+            "affection": 0,
+            "hostility": 0,
+            "authority": 0,
+            "debt": 0,
+            "shared_history": 1,
+            "visibility": 1,
+        }
+        for seed in seeds:
+            for key, value in seed.get("dimension_seed", {}).items():
+                dims[key] = max(dims.get(key, 0), value)
+        relationships[rel_id] = {
+            "runtime_relationship_id": rel_id,
+            "canonical_relation_id": state.get("relation_id"),
+            "participant_ids": state.get("participant_ids", []),
+            "current_dimensions": dims,
+            "current_labels": [state.get("current_value", "")],
+            "status": state.get("status", "established_by_cutoff"),
+            "visible_to_agent_ids": [],
+            "source_event_ids": [],
+            "last_updated_by_event_id": state.get("last_updated_by_event_id"),
+            "policy": {
+                "labels_are_derived_from_dimensions": True,
+                "changes_require_runtime_event": True,
+                "different_runtime_paths_can_diverge_from_canon": True,
+            },
+            "evidence_refs": state.get("evidence_refs", []),
+        }
+    output = {
+        "schema_version": LAYER_SCHEMA_VERSION,
+        "layer": "Runtime Relationship DB",
+        "purpose": "Current relationship truth for the live simulation.",
+        "source_simulation_state_template_fingerprint": simulation_state_db.get(
+            "simulation_state_template_fingerprint"
+        ),
+        "relationships": relationships,
+        "change_log": [],
+        "policy": {
+            "not_derived_from_final_canon": True,
+            "event_sourced": True,
+            "agent_visibility_can_differ": True,
+        },
+    }
+    output["runtime_relationship_db_fingerprint"] = stable_json_hash(
+        {key: value for key, value in output.items() if key != "runtime_relationship_db_fingerprint"}
+    )
+    return output
+
+
+def build_runtime_agent_state(agent_profiles, simulation_state_db, runtime_relationship_db=None):
+    runtime_relationship_db = runtime_relationship_db or {}
+    current = simulation_state_db.get("current_world_state", {})
+    agent_states = {}
+    for profile in agent_profiles.get("agents", []):
+        agent_id = profile.get("agent_id")
+        character_id = profile.get("character_id")
+        if not agent_id or not character_id:
+            continue
+        entity_state = current.get("entity_states", {}).get(character_id, {})
+        known_relationship_ids = [
+            rel_id
+            for rel_id, relation in runtime_relationship_db.get(
+                "relationships", {}
+            ).items()
+            if character_id in relation.get("participant_ids", [])
+        ]
+        agent_states[agent_id] = {
+            "agent_id": agent_id,
+            "character_id": character_id,
+            "canonical_profile_fingerprint": profile.get("profile_fingerprint"),
+            "runtime_status": entity_state.get("record_status", "unknown_at_cutoff"),
+            "current_location": entity_state.get("mutable_fields", {}).get(
+                "current_location"
+            ),
+            "known_resource_ids": [
+                resource_id
+                for resource_id, resource in current.get(
+                    "resource_states", {}
+                ).items()
+                if character_id
+                in set(
+                    resource.get("current_owner_ids", [])
+                    + resource.get("current_user_ids", [])
+                    + resource.get("current_holder_ids", [])
+                )
+            ],
+            "known_relationship_ids": known_relationship_ids,
+            "knowledge_scope": profile.get("state", {}).get("knowledge_scope", []),
+            "short_term_memory": [],
+            "long_term_memory_refs": [],
+            "current_goals": profile.get("state", {}).get("goals", []),
+            "last_updated_by_event_id": None,
+            "policy": {
+                "profile_is_template": True,
+                "runtime_truth_lives_here_and_in_simulation_state": True,
+                "agent_decisions_must_use_current_state": True,
+            },
+        }
+    output = {
+        "schema_version": LAYER_SCHEMA_VERSION,
+        "layer": "Runtime Agent State",
+        "purpose": "Dynamic agent state separated from canonical profile templates.",
+        "source_agent_profile_db_fingerprint": agent_profiles.get(
+            "agent_profile_db_fingerprint"
+        ),
+        "source_simulation_state_template_fingerprint": simulation_state_db.get(
+            "simulation_state_template_fingerprint"
+        ),
+        "agent_states": agent_states,
+        "policy": {
+            "do_not_modify_agent_profiles_during_simulation": True,
+            "runtime_agent_state_is_mutable": True,
+        },
+    }
+    output["runtime_agent_state_fingerprint"] = stable_json_hash(
+        {key: value for key, value in output.items() if key != "runtime_agent_state_fingerprint"}
+    )
+    return output
+
+
+def build_runtime_log(simulation_state_db, runtime_event_db=None):
+    runtime_event_db = runtime_event_db or {}
+    output = {
+        "schema_version": LAYER_SCHEMA_VERSION,
+        "layer": "Runtime Log",
+        "purpose": "Event-sourcing ledger for simulation branches.",
+        "source_simulation_state_template_fingerprint": simulation_state_db.get(
+            "simulation_state_template_fingerprint"
+        ),
+        "entries": [
+            {
+                "log_id": "log_initial_checkpoint",
+                "entry_type": "initial_checkpoint",
+                "cutoff_order": simulation_state_db.get("cutoff_order", 0),
+                "state_revision": 0,
+                "description": "Runtime initialized from canonical cutoff template.",
+            }
+        ],
+        "runtime_event_db_fingerprint": runtime_event_db.get(
+            "runtime_event_db_fingerprint"
+        ),
+    }
+    output["runtime_log_fingerprint"] = stable_json_hash(
+        {key: value for key, value in output.items() if key != "runtime_log_fingerprint"}
+    )
+    return output
+
+
 def enhance_world_db_with_state_layers(world_db, world_graph, normalized, cutoff_order=None):
     canonical_db = build_canonical_novel_db(world_graph, normalized, world_db)
+    component_dbs = build_canonical_component_dbs(canonical_db, world_db)
     simulation_state_db = build_simulation_state_db(
         canonical_db,
         cutoff_order=cutoff_order,
         existing_world_state=world_db.get("world_state"),
     )
     runtime_event_db = build_runtime_event_db(canonical_db, simulation_state_db)
+    runtime_relationship_db = build_runtime_relationship_db(
+        simulation_state_db,
+        component_dbs.get("canonical_relationship_db", {}),
+    )
+    runtime_log = build_runtime_log(simulation_state_db, runtime_event_db)
     world_db["canonical_novel_db"] = canonical_db
+    world_db["canonical_component_dbs"] = component_dbs
+    world_db.update(component_dbs)
     world_db["simulation_state_db"] = simulation_state_db
+    world_db["simulation_state_template"] = simulation_state_db
     world_db["runtime_event_db"] = runtime_event_db
+    world_db["runtime_relationship_db"] = runtime_relationship_db
+    world_db["runtime_log"] = runtime_log
     world_db["dependency_graph"] = canonical_db["dependency_graph"]
     world_db["acquisition_system"] = canonical_db["acquisition_system"]
     world_db["layered_world_state_policy"] = {
         "canonical_db_is_read_only": True,
-        "simulation_state_is_cutoff_state": True,
+        "canonical_components_are_read_only": True,
+        "simulation_state_template_is_cutoff_state": True,
+        "runtime_simulation_state_is_live_truth": True,
         "runtime_event_db_controls_future_progress": True,
+        "runtime_relationship_db_controls_current_relationship_truth": True,
         "resource_grants_require_dependency_checks": True,
         "agents_use_current_state_not_canonical_ending": True,
     }
@@ -1061,6 +1747,9 @@ def enhance_world_db_with_state_layers(world_db, world_graph, normalized, cutoff
             )
         ),
         "runtime_event_queue_count": len(runtime_event_db.get("event_queue", [])),
+        "runtime_relationship_count": len(
+            runtime_relationship_db.get("relationships", {})
+        ),
         "exclusive_resource_count": canonical_db.get("validation", {}).get(
             "exclusive_resource_count", 0
         ),
@@ -1075,20 +1764,57 @@ def write_world_state_layer_files(base_dir, world_db):
     base_dir = Path(base_dir)
     files = {
         "canonical_novel_db.json": world_db.get("canonical_novel_db", {}),
+        "canonical_timeline_db.json": world_db.get("canonical_timeline_db", {}),
+        "canonical_event_db.json": world_db.get("canonical_event_db", {}),
+        "canonical_character_db.json": world_db.get("canonical_character_db", {}),
+        "canonical_relationship_db.json": world_db.get("canonical_relationship_db", {}),
+        "canonical_ability_db.json": world_db.get("canonical_ability_db", {}),
+        "canonical_item_db.json": world_db.get("canonical_item_db", {}),
+        "canonical_organization_db.json": world_db.get("canonical_organization_db", {}),
+        "canonical_location_db.json": world_db.get("canonical_location_db", {}),
+        "canonical_world_rule_db.json": world_db.get("canonical_world_rule_db", {}),
+        "canonical_knowledge_db.json": world_db.get("canonical_knowledge_db", {}),
         "simulation_state_db.json": world_db.get("simulation_state_db", {}),
+        "simulation_state_template.json": world_db.get("simulation_state_template", {}),
         "runtime_event_db.json": world_db.get("runtime_event_db", {}),
+        "runtime_relationship_db.json": world_db.get("runtime_relationship_db", {}),
+        "runtime_log.json": world_db.get("runtime_log", {}),
     }
     for name, payload in files.items():
         atomic_write_json(base_dir / name, payload)
     return files
 
 
+def write_runtime_agent_state_file(base_dir, agent_profiles, simulation_state_db, runtime_relationship_db=None):
+    base_dir = Path(base_dir)
+    runtime_agent_state = build_runtime_agent_state(
+        agent_profiles,
+        simulation_state_db,
+        runtime_relationship_db=runtime_relationship_db,
+    )
+    atomic_write_json(base_dir / "runtime_agent_state.json", runtime_agent_state)
+    return runtime_agent_state
+
+
 def load_layer_sidecars(world_db, base_dir):
     base_dir = Path(base_dir)
     mapping = {
         "canonical_novel_db": "canonical_novel_db.json",
+        "canonical_timeline_db": "canonical_timeline_db.json",
+        "canonical_event_db": "canonical_event_db.json",
+        "canonical_character_db": "canonical_character_db.json",
+        "canonical_relationship_db": "canonical_relationship_db.json",
+        "canonical_ability_db": "canonical_ability_db.json",
+        "canonical_item_db": "canonical_item_db.json",
+        "canonical_organization_db": "canonical_organization_db.json",
+        "canonical_location_db": "canonical_location_db.json",
+        "canonical_world_rule_db": "canonical_world_rule_db.json",
+        "canonical_knowledge_db": "canonical_knowledge_db.json",
         "simulation_state_db": "simulation_state_db.json",
+        "simulation_state_template": "simulation_state_template.json",
         "runtime_event_db": "runtime_event_db.json",
+        "runtime_relationship_db": "runtime_relationship_db.json",
+        "runtime_log": "runtime_log.json",
     }
     for key, filename in mapping.items():
         path = base_dir / filename

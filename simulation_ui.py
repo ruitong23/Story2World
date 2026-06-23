@@ -69,12 +69,12 @@ class SimulationApp:
         )
         llm = make_llm_callable(self.base_url, self.model, self.api_key)
         self.runtime = load_step17_runtime(
-            world_path=generated_db_path("world", "world_db.json"),
+            world_path=generated_db_path("canonical", "world_db.json"),
             character_path=generated_db_path(
-                "characters", "character_state_db.json"
+                "canonical", "canonical_character_db.json"
             ),
             agent_path=generated_db_path("agents", "agent_profiles.json"),
-            state_path=generated_db_path("world", "simulation_state.json"),
+            state_path=generated_db_path("runtime", "simulation_state.json"),
             llm_callable=llm,
         )
         self.store = self.runtime["store"]
@@ -99,6 +99,8 @@ class SimulationApp:
         self.progress_value = tk.DoubleVar(value=0)
         self.progress_text = tk.StringVar(value="Ready")
         self.eta_text = tk.StringVar(value="ETA: --")
+        self.story_progress_value = tk.DoubleVar(value=0)
+        self.story_progress_text = tk.StringVar(value="Story progress: --")
 
         self._build_ui()
         self._refresh_agent_list()
@@ -169,6 +171,14 @@ class SimulationApp:
         )
         ttk.Button(runtime_frame, text="Reset world", command=self.reset_world).grid(
             row=1, column=2, rowspan=2, padx=(8, 0)
+        )
+        ttk.Progressbar(
+            runtime_frame,
+            variable=self.story_progress_value,
+            maximum=100,
+        ).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(runtime_frame, textvariable=self.story_progress_text).grid(
+            row=4, column=0, columnspan=3, sticky="w"
         )
 
         notebook = ttk.Notebook(right)
@@ -268,6 +278,7 @@ class SimulationApp:
             "goals": character.get("goals", []),
             "constraints": character.get("constraints", []),
             "abilities": character.get("abilities", []),
+            "story_progress": self._story_progress_snapshot(),
             "runtime": runtime_state,
         }
         self._set_text(
@@ -324,7 +335,7 @@ class SimulationApp:
 
     def reset_world(self):
         if not messagebox.askyesno(
-            "Reset simulation", "Reset simulation_state.json to a new main branch?"
+            "Reset simulation", "Reset runtime/simulation_state.json to a new main branch?"
         ):
             return
         self.store.reset()
@@ -366,8 +377,95 @@ class SimulationApp:
             f"{minute // 60:02d}:{minute % 60:02d} | "
             f"Revision {snapshot.get('revision', 0)} | Model {self.model}"
         )
+        story_progress = self._story_progress_snapshot()
+        self.story_progress_value.set(story_progress["canonical_percent"])
+        self.story_progress_text.set(story_progress["label"])
         if focus_id:
             self._show_character_status(focus_id)
+
+    def _prepared_source_progress(self):
+        graph_path = generated_db_path("graph", "raw_graph_triples.json")
+        try:
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {
+                "completed": 0,
+                "available": 0,
+                "percent": 0.0,
+            }
+        completed = int(graph.get("completed_chunk_count") or 0)
+        available = int(
+            graph.get("available_source_chunk_count")
+            or graph.get("total_source_chunk_count")
+            or 0
+        )
+        available_unknown = not bool(available)
+        if not available:
+            manifest = graph.get("chunk_manifest", [])
+            expected = int(graph.get("expected_chunk_count") or len(manifest) or 0)
+            available = expected
+        percent = completed * 100 / available if available else 0.0
+        return {
+            "completed": completed,
+            "available": available,
+            "available_unknown": available_unknown,
+            "percent": max(0.0, min(100.0, percent)),
+        }
+
+    def _story_progress_snapshot(self):
+        runtime = self.store.runtime
+        timeline = (
+            runtime.get("canonical_timeline")
+            or self.runtime["world_db"]
+            .get("canonical_timeline_db", {})
+            .get("timeline_nodes", [])
+        )
+        total_canonical_events = len(timeline)
+        cursor = int(runtime.get("timeline_cursor", 0) or 0)
+        cursor = max(0, min(cursor, total_canonical_events))
+        reached = (
+            min(total_canonical_events, cursor + 1)
+            if total_canonical_events and runtime.get("active_scene")
+            else cursor
+        )
+        runtime_event_count = len(self.store.branch.get("events", []))
+        committed_runtime_events = len(
+            runtime.get("runtime_event_db", {}).get("runtime_committed_events", [])
+        )
+        prepared = self._prepared_source_progress()
+        canonical_percent = (
+            reached * 100 / total_canonical_events
+            if total_canonical_events
+            else 0.0
+        )
+        if prepared.get("available_unknown"):
+            prepared_label = (
+                f"Prepared scope: {prepared['completed']} chunks "
+                "(source total unavailable until the next preparation run)"
+            )
+        else:
+            prepared_label = (
+                f"Prepared source: {prepared['completed']}/{prepared['available']} "
+                f"chunks ({prepared['percent']:.1f}%)"
+            )
+        label = (
+            f"{prepared_label} | "
+            f"Canonical position in prepared scope: {reached}/{total_canonical_events} "
+            f"events ({canonical_percent:.1f}%) | "
+            f"Runtime events: {runtime_event_count} "
+            f"(sidecar commits {committed_runtime_events})"
+        )
+        return {
+            "canonical_percent": max(0.0, min(100.0, canonical_percent)),
+            "prepared_source_percent": prepared["percent"],
+            "prepared_completed_chunks": prepared["completed"],
+            "prepared_available_chunks": prepared["available"],
+            "canonical_reached_events": reached,
+            "canonical_total_events": total_canonical_events,
+            "runtime_event_count": runtime_event_count,
+            "sidecar_committed_event_count": committed_runtime_events,
+            "label": label,
+        }
 
     @staticmethod
     def _set_text(widget, text):

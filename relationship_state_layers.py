@@ -543,15 +543,15 @@ def write_relationship_files(base_dir, weak_db=None, canonical_db=None, arc_db=N
     base_dir = Path(base_dir)
     written = {}
     if weak_db is not None:
-        path = base_dir / "world" / "mention_weak_relations.json"
+        path = base_dir / "graph" / "mention_weak_relations.json"
         atomic_write_json(path, weak_db)
         written["mention_weak_relations"] = str(path)
     if canonical_db is not None:
-        path = base_dir / "world" / "canonical_relationships_db.json"
+        path = base_dir / "canonical" / "canonical_relationship_db.json"
         atomic_write_json(path, canonical_db)
-        written["canonical_relationships_db"] = str(path)
+        written["canonical_relationship_db"] = str(path)
     if arc_db is not None:
-        path = base_dir / "world" / "relationship_arc_db.json"
+        path = base_dir / "canonical" / "relationship_arc_db.json"
         atomic_write_json(path, arc_db)
         written["relationship_arc_db"] = str(path)
     return written

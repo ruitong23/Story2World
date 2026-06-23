@@ -21,6 +21,12 @@ def _parse_arguments():
     parser.add_argument("--percent", type=float, default=100.0)
     parser.add_argument("--chunk-size", type=int, default=2000)
     parser.add_argument("--overlap", type=int, default=300)
+    parser.add_argument(
+        "--chunk-limit",
+        type=int,
+        default=30,
+        help="Maximum Step 9 chunks to process. Use 0 for all selected chunks.",
+    )
     return parser.parse_args()
 
 
@@ -74,80 +80,8 @@ builtins.print = _pipeline_print
 emit_progress(1, "Reading source novel")
 
 
-# %% Notebook cell 0
-# Step 1：读取小说文件
-# 安装依赖：
-# pip install chardet
-
-import chardet
-from pathlib import Path
-
-
-def detect_encoding(file_path, sample_size=100000):
-    """
-    自动检测 txt 文件编码
-    """
-    file_path = Path(file_path)
-
-    with open(file_path, "rb") as f:
-        raw_data = f.read(sample_size)
-
-    result = chardet.detect(raw_data)
-
-    encoding = result.get("encoding")
-    confidence = result.get("confidence")
-
-    print("检测到的编码:", encoding)
-    print("检测置信度:", confidence)
-
-    return encoding
-
-
-def read_novel_txt(file_path):
-    """
-    读取小说 txt 文件，自动处理常见中文编码问题
-    """
-    file_path = Path(file_path)
-
-    if not file_path.exists():
-        raise FileNotFoundError(f"文件不存在: {file_path}")
-
-    detected_encoding = detect_encoding(file_path)
-
-    encoding_candidates = [
-        detected_encoding,
-        "utf-8",
-        "utf-8-sig",
-        "gb18030",
-        "gbk",
-        "gb2312"
-    ]
-
-    # 去掉 None 和重复编码
-    encoding_candidates = list(dict.fromkeys([e for e in encoding_candidates if e]))
-
-    for encoding in encoding_candidates:
-        try:
-            with open(file_path, "r", encoding=encoding) as f:
-                text = f.read()
-
-            print(f"\n成功使用编码读取: {encoding}")
-            print("小说总字数:", len(text))
-            print("\n前 1000 字预览：")
-            print(text[:1000])
-
-            return text
-
-        except UnicodeDecodeError:
-            print(f"编码失败: {encoding}")
-
-    raise UnicodeDecodeError(
-        "unknown",
-        b"",
-        0,
-        1,
-        "所有候选编码都读取失败，请检查文件是否为正常 txt"
-    )
+# %% Stable source-text loader
+from novel_text_io import detect_encoding, read_novel_txt
 
 
 # %% Notebook cell 1
@@ -854,11 +788,33 @@ except ImportError:
     OpenAI = None
 
 
-LLM_BASE_URL = os.getenv("NOVEL_LLM_BASE_URL", "http://localhost:1234/v1").rstrip("/")
+def load_pipeline_settings():
+    settings_path = Path(__file__).resolve().parent / "settings.json"
+    defaults = {
+        "llm_base_url": "http://localhost:1234/v1",
+        "llm_model": "local-model",
+        "llm_api_key": "lm-studio",
+    }
+    if not settings_path.is_file():
+        return defaults
+    try:
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    return {**defaults, **saved}
+
+
+PIPELINE_SETTINGS = load_pipeline_settings()
+LLM_BASE_URL = os.getenv(
+    "NOVEL_LLM_BASE_URL",
+    PIPELINE_SETTINGS["llm_base_url"],
+).rstrip("/")
 LLM_API_KEY = (
-    os.getenv("NOVEL_LLM_API_KEY", "").strip() or "lm-studio"
+    os.getenv("NOVEL_LLM_API_KEY", "").strip()
+    or PIPELINE_SETTINGS["llm_api_key"]
+    or "lm-studio"
 )
-LLM_MODEL = os.getenv("NOVEL_LLM_MODEL", "local-model")
+LLM_MODEL = os.getenv("NOVEL_LLM_MODEL", PIPELINE_SETTINGS["llm_model"])
 PROJECT_LANGUAGE_OVERRIDE = os.getenv(
     "NOVEL_PROJECT_LANGUAGE", ""
 ).strip()
@@ -1501,7 +1457,7 @@ from pathlib import Path
 STEP9_ONTOLOGY_PATH = Path("novel_ontology.json")
 STEP9_OUTPUT_PATH = Path("raw_graph_triples.json")
 STEP9_CHUNK_START = 0
-STEP9_CHUNK_LIMIT = 30
+STEP9_CHUNK_LIMIT = ARGS.chunk_limit if ARGS.chunk_limit else None
 STEP9_MAX_NEW_CHUNKS = None
 STEP9_REPROCESS_CHUNK_IDS = set()
 STEP9_VALIDATION_RETRIES = 2
@@ -1516,14 +1472,18 @@ STEP9_FORCE_REBUILD = False
 
 if not 0 < ARGS.percent <= 100:
     raise ValueError("--percent must be greater than 0 and at most 100.")
-STEP9_CHUNK_LIMIT = max(
+STEP9_PERCENT_CHUNK_LIMIT = max(
     1,
     math.ceil(len(project_data["chunks"]) * ARGS.percent / 100.0),
 )
+if STEP9_CHUNK_LIMIT is None:
+    STEP9_CHUNK_LIMIT = STEP9_PERCENT_CHUNK_LIMIT
+else:
+    STEP9_CHUNK_LIMIT = max(1, min(STEP9_PERCENT_CHUNK_LIMIT, STEP9_CHUNK_LIMIT))
 STEP9_FORCE_REBUILD = False
 print(
     f"Selected {STEP9_CHUNK_LIMIT}/{len(project_data['chunks'])} chunks "
-    f"({ARGS.percent:g}% requested)."
+    f"({ARGS.percent:g}% requested, chunk limit={ARGS.chunk_limit})."
 )
 emit_progress(9, "Starting graph extraction")
 
@@ -2472,6 +2432,13 @@ def new_step9_state(chunks, ontology):
         "chunk_manifest": chunk_manifest,
         "chunk_manifest_fingerprint": stable_json_hash(chunk_manifest),
         "expected_chunk_count": len(chunks),
+        "available_source_chunk_count": len(project_data.get("chunks", chunks)),
+        "selected_source_percent": ARGS.percent,
+        "prepared_source_percent": (
+            round(len(chunks) * 100 / len(project_data.get("chunks", chunks)), 4)
+            if project_data.get("chunks")
+            else 100.0
+        ),
         "completed_chunk_count": 0,
         "complete": False,
         "results": [],
@@ -4814,6 +4781,7 @@ STEP12_CANONICAL_PATH = Path("canonical_entities.json")
 STEP12_OUTPUT_PATH = Path("normalized_graph_triples.json")
 STEP12_WEAK_RELATIONS_PATH = Path("mention_weak_relations.json")
 STEP12_CANONICAL_RELATIONSHIPS_PATH = Path("canonical_relationships_db.json")
+STEP12_CANONICAL_RELATIONSHIP_PATH = Path("canonical_relationship_db.json")
 STEP12_RELATIONSHIP_ARC_PATH = Path("relationship_arc_db.json")
 
 IDENTITY_RELATION_TYPES = {
@@ -5338,10 +5306,17 @@ atomic_write_json(
     STEP12_CANONICAL_RELATIONSHIPS_PATH,
     canonical_relationships_db,
 )
+atomic_write_json(
+    STEP12_CANONICAL_RELATIONSHIP_PATH,
+    canonical_relationships_db,
+)
 atomic_write_json(STEP12_RELATIONSHIP_ARC_PATH, relationship_arc_db)
 project_data["normalized_graph_triples_path"] = str(STEP12_OUTPUT_PATH)
 project_data["canonical_relationships_db_path"] = str(
     STEP12_CANONICAL_RELATIONSHIPS_PATH
+)
+project_data["canonical_relationship_db_path"] = str(
+    STEP12_CANONICAL_RELATIONSHIP_PATH
 )
 project_data["relationship_arc_db_path"] = str(STEP12_RELATIONSHIP_ARC_PATH)
 print("Step 12 output:", STEP12_OUTPUT_PATH)
@@ -6159,12 +6134,21 @@ STEP15_WORLD_GRAPH_PATH = Path("structured_world_graph.json")
 STEP15_NORMALIZED_PATH = Path("normalized_graph_triples.json")
 STEP15_OUTPUT_PATH = Path("world_db.json")
 STEP15_CANONICAL_DB_PATH = Path("canonical_novel_db.json")
-STEP15_SIMULATION_STATE_DB_PATH = Path("simulation_state_db.json")
+STEP15_CANONICAL_TIMELINE_DB_PATH = Path("canonical_timeline_db.json")
+STEP15_CANONICAL_EVENT_DB_PATH = Path("canonical_event_db.json")
+STEP15_SIMULATION_STATE_DB_PATH = Path("simulation_state_template.json")
 STEP15_RUNTIME_EVENT_DB_PATH = Path("runtime_event_db.json")
+STEP15_RUNTIME_RELATIONSHIP_DB_PATH = Path("runtime_relationship_db.json")
 
 from world_state_layers import (
+    build_canonical_component_dbs,
+    build_runtime_event_db,
+    build_runtime_log,
+    build_runtime_relationship_db,
+    build_runtime_agent_state,
     enhance_world_db_with_state_layers,
     write_world_state_layer_files,
+    write_runtime_agent_state_file,
 )
 
 STEP15_WORLD_CATEGORIES = {
@@ -7641,6 +7625,7 @@ step15_normalized = json.loads(
 )
 world_db = build_world_db(step15_world_graph, step15_normalized)
 for relationship_path, relationship_key in (
+    (Path("canonical_relationship_db.json"), "canonical_relationship_db"),
     (Path("canonical_relationships_db.json"), "canonical_relationships_db"),
     (Path("relationship_arc_db.json"), "relationship_arc_db"),
 ):
@@ -7650,6 +7635,10 @@ for relationship_path, relationship_key in (
         )
 world_db["relationship_system"] = {
     "canonical_relationships_db": world_db.get("canonical_relationships_db", {}),
+    "canonical_relationship_db": world_db.get(
+        "canonical_relationship_db",
+        world_db.get("canonical_relationships_db", {}),
+    ),
     "relationship_arc_db": world_db.get("relationship_arc_db", {}),
     "policy": {
         "mention_weak_relations_before_entity_resolution": True,
@@ -7657,6 +7646,23 @@ world_db["relationship_system"] = {
         "agent_relationship_tracking_uses_runtime_events": True,
     },
 }
+if world_db.get("canonical_novel_db"):
+    canonical_component_dbs = build_canonical_component_dbs(
+        world_db["canonical_novel_db"],
+        world_db,
+    )
+    world_db["canonical_component_dbs"] = canonical_component_dbs
+    world_db.update(canonical_component_dbs)
+    world_db["runtime_relationship_db"] = build_runtime_relationship_db(
+        world_db.get("simulation_state_template")
+        or world_db.get("simulation_state_db", {}),
+        world_db.get("canonical_relationship_db", {}),
+    )
+    world_db["runtime_log"] = build_runtime_log(
+        world_db.get("simulation_state_template")
+        or world_db.get("simulation_state_db", {}),
+        world_db.get("runtime_event_db", {}),
+    )
 world_db["world_db_fingerprint"] = stable_json_hash({
     key: value
     for key, value in world_db.items()
@@ -7666,14 +7672,20 @@ atomic_write_json(STEP15_OUTPUT_PATH, world_db)
 write_world_state_layer_files(Path("."), world_db)
 project_data["world_db_path"] = str(STEP15_OUTPUT_PATH)
 project_data["canonical_novel_db_path"] = str(STEP15_CANONICAL_DB_PATH)
-project_data["simulation_state_db_path"] = str(STEP15_SIMULATION_STATE_DB_PATH)
+project_data["canonical_timeline_db_path"] = str(STEP15_CANONICAL_TIMELINE_DB_PATH)
+project_data["canonical_event_db_path"] = str(STEP15_CANONICAL_EVENT_DB_PATH)
+project_data["simulation_state_template_path"] = str(STEP15_SIMULATION_STATE_DB_PATH)
 project_data["runtime_event_db_path"] = str(STEP15_RUNTIME_EVENT_DB_PATH)
+project_data["runtime_relationship_db_path"] = str(STEP15_RUNTIME_RELATIONSHIP_DB_PATH)
 print("Step 15 output:", STEP15_OUTPUT_PATH)
 print(
     "Step 15 layered outputs:",
     STEP15_CANONICAL_DB_PATH,
+    STEP15_CANONICAL_TIMELINE_DB_PATH,
+    STEP15_CANONICAL_EVENT_DB_PATH,
     STEP15_SIMULATION_STATE_DB_PATH,
     STEP15_RUNTIME_EVENT_DB_PATH,
+    STEP15_RUNTIME_RELATIONSHIP_DB_PATH,
 )
 print(
     "world entities:",
@@ -8472,13 +8484,22 @@ agent_profile_db["agent_profile_db_fingerprint"] = stable_json_hash({
     if key != "agent_profile_db_fingerprint"
 })
 atomic_write_json(STEP16_OUTPUT_PATH, agent_profile_db)
+runtime_agent_state_db = write_runtime_agent_state_file(
+    Path("."),
+    agent_profile_db,
+    world_db.get("simulation_state_template")
+    or world_db.get("simulation_state_db", {}),
+    world_db.get("runtime_relationship_db", {}),
+)
 project_data["agent_profiles_path"] = str(STEP16_OUTPUT_PATH)
+project_data["runtime_agent_state_path"] = "runtime_agent_state.json"
 published_databases = publish_generated_databases(Path("."))
 project_data["generated_db_paths"] = published_databases
 
 print("Step 16 output:", STEP16_OUTPUT_PATH)
 print("Generated DB folder:", Path("generated_db").resolve())
 print("Generated DB files:", len(published_databases))
+print("runtime agent states:", len(runtime_agent_state_db.get("agent_states", {})))
 print("identity LLM calls: 0")
 print("agents:", agent_profile_db["agent_count"])
 print("tiers:", agent_profile_db["tier_counts"])
