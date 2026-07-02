@@ -46,6 +46,7 @@ CANONICAL_FILES = [
 AGENT_FILES = [
     "agent_profiles.json",
     "runtime_agent_state.json",
+    "runtime_motivation_state.json",
 ]
 
 RUNTIME_FILES = [

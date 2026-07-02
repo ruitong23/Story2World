@@ -56,6 +56,7 @@ PREPARATION_OUTPUTS = [
     ("db/runtime/runtime_log.json", "Runtime event-sourcing log"),
     ("db/agents/agent_profiles.json", "Canonical agent profile templates"),
     ("db/agents/runtime_agent_state.json", "Runtime agent dynamic state"),
+    ("db/agents/runtime_motivation_state.json", "Runtime agent motivation state"),
 ]
 
 SIMULATION_REQUIRED_FILES = [
@@ -68,6 +69,7 @@ SIMULATION_REQUIRED_FILES = [
     ("db/canonical/canonical_character_db.json", "Canonical character template database"),
     ("db/agents/agent_profiles.json", "Canonical agent profile templates"),
     ("db/agents/runtime_agent_state.json", "Runtime agent dynamic state"),
+    ("db/agents/runtime_motivation_state.json", "Runtime agent motivation state"),
     ("step17_runtime.py", "Step 17 simulation engine"),
 ]
 

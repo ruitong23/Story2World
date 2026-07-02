@@ -1845,8 +1845,135 @@ def build_runtime_relationship_db(simulation_state_db, canonical_relationship_db
     return output
 
 
+def build_motivation_action_policy(core, objectives, fears, strategies):
+    text = "；".join(
+        str(item).strip()
+        for item in [
+            *core.get("root_drives", []),
+            *objectives,
+            *fears,
+            *strategies,
+            *core.get("temptations", []),
+            *core.get("trigger_rules", []),
+        ]
+        if str(item).strip()
+    )
+    pursues_tang = "唐僧" in text or "唐僧肉" in text
+    has_high_threat = any(
+        word in text
+        for word in ("孙悟空", "悟空", "火眼金睛", "识破", "暴露", "降伏", "诛杀")
+    )
+    uses_disguise = any(
+        word in text
+        for word in ("伪装", "变身", "化身", "临时身份", "骗", "诱")
+    )
+    forward_actions = ["观察", "试探", "换策略", "保留下一步机会"]
+    if uses_disguise:
+        forward_actions.extend(["维护伪装", "变换身份", "制造误判"])
+    if pursues_tang:
+        forward_actions.extend(["接近唐僧", "诱导唐僧", "分散护卫注意"])
+    if has_high_threat:
+        forward_actions.extend(["绕开孙悟空视线", "拉开风险距离", "等待护卫破绽"])
+    return {
+        "priority": "根本欲望决定方向；恐惧只改变路线、节奏和伪装强度。",
+        "when_threatened": (
+            "高威胁下先隐蔽推进核心目标：维护伪装、换身份、转移视线、"
+            "分散威胁、试探目标或制造机会；暂避必须同时保留下一步机会。"
+        ),
+        "stall_guard": (
+            "除非玩家明确要求或角色被外力限制，不要整轮只屏息、僵住、"
+            "装死、扮石头或反复描写恐惧；停顿之后必须出现目标导向的判断或动作。"
+        ),
+        "action_bias": (
+            "risk_managed_pursuit"
+            if pursues_tang and has_high_threat
+            else "goal_directed_survival"
+        ),
+        "forward_actions": list(dict.fromkeys(forward_actions))[:12],
+        "risk_can_override_goal": False,
+    }
+
+
+def build_runtime_motivation_state(agent_profiles):
+    states = {}
+    for profile in agent_profiles.get("agents", []):
+        character_id = profile.get("character_id")
+        if not character_id:
+            continue
+        core = profile.get("core_motivation", {}) or {}
+        current_objectives = (
+            core.get("current_true_objectives")
+            or core.get("current_objectives")
+            or profile.get("state", {}).get("goals", [])
+        )
+        fears = core.get("fears_or_constraints") or core.get("fears", [])
+        strategies = core.get("strategy_identities") or core.get(
+            "strategy_patterns", []
+        )
+        text = "；".join(
+            str(item)
+            for item in [
+                *core.get("root_drives", []),
+                *current_objectives,
+                *fears,
+                *strategies,
+                *core.get("temptations", []),
+            ]
+        )
+        pursues_tang = "唐僧" in text or "唐僧肉" in text
+        has_disguise = any(
+            "伪装" in str(item) or "变身" in str(item)
+            for item in strategies
+        )
+        action_policy = core.get("action_policy") or build_motivation_action_policy(
+            core,
+            current_objectives,
+            fears,
+            strategies,
+        )
+        states[character_id] = {
+            "character_id": character_id,
+            "dominant_drive": (core.get("root_drives") or [""])[0],
+            "active_objective": (current_objectives or [""])[0],
+            "active_fear": (fears or [""])[0],
+            "current_strategy": (strategies or [""])[0],
+            "desire_intensity": (
+                55 if pursues_tang else 35 if core.get("root_drives") else 10
+            ),
+            "fear_intensity": (
+                35 if pursues_tang and fears else 25 if fears else 5
+            ),
+            "attachment_focus": (core.get("attachments") or [""])[0],
+            "temptation_focus": (core.get("temptations") or [""])[0],
+            "disguise_pressure": (
+                55 if pursues_tang and has_disguise else 35 if has_disguise
+                else 0
+            ),
+            "action_policy": action_policy,
+            "confidence": "template",
+            "last_trigger": "",
+            "last_updated_by_event_id": None,
+            "history": [],
+        }
+    output = {
+        "schema_version": LAYER_SCHEMA_VERSION,
+        "layer": "Runtime Motivation State",
+        "purpose": "Mutable desire, fear, strategy and disguise pressure for runtime agents.",
+        "states": states,
+        "policy": {
+            "canonical_core_motivation_is_template": True,
+            "runtime_motivation_state_is_mutable": True,
+        },
+    }
+    output["runtime_motivation_state_fingerprint"] = stable_json_hash(
+        {key: value for key, value in output.items() if key != "runtime_motivation_state_fingerprint"}
+    )
+    return output
+
+
 def build_runtime_agent_state(agent_profiles, simulation_state_db, runtime_relationship_db=None):
     runtime_relationship_db = runtime_relationship_db or {}
+    runtime_motivation_state = build_runtime_motivation_state(agent_profiles)
     current = simulation_state_db.get("current_world_state", {})
     agent_states = {}
     for profile in agent_profiles.get("agents", []):
@@ -1887,6 +2014,9 @@ def build_runtime_agent_state(agent_profiles, simulation_state_db, runtime_relat
             "short_term_memory": [],
             "long_term_memory_refs": [],
             "current_goals": profile.get("state", {}).get("goals", []),
+            "motivation_runtime": runtime_motivation_state.get(
+                "states", {}
+            ).get(character_id, {}),
             "last_updated_by_event_id": None,
             "policy": {
                 "profile_is_template": True,
@@ -1905,6 +2035,9 @@ def build_runtime_agent_state(agent_profiles, simulation_state_db, runtime_relat
             "simulation_state_template_fingerprint"
         ),
         "agent_states": agent_states,
+        "runtime_motivation_state_fingerprint": runtime_motivation_state.get(
+            "runtime_motivation_state_fingerprint"
+        ),
         "policy": {
             "do_not_modify_agent_profiles_during_simulation": True,
             "runtime_agent_state_is_mutable": True,
@@ -2033,7 +2166,12 @@ def write_runtime_agent_state_file(base_dir, agent_profiles, simulation_state_db
         simulation_state_db,
         runtime_relationship_db=runtime_relationship_db,
     )
+    runtime_motivation_state = build_runtime_motivation_state(agent_profiles)
     atomic_write_json(base_dir / "runtime_agent_state.json", runtime_agent_state)
+    atomic_write_json(
+        base_dir / "runtime_motivation_state.json",
+        runtime_motivation_state,
+    )
     return runtime_agent_state
 
 
