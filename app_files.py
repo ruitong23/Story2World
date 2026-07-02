@@ -84,25 +84,165 @@ def file_status(rows, base_dir=APP_DIR):
     ]
 
 
-def load_settings():
-    defaults = {
+def default_llm_settings():
+    return {
+        "profile_name": "Local LM Studio",
         "llm_base_url": "http://localhost:1234/v1",
         "llm_model": "gemma-4-26b-a4b-it",
         "llm_api_key": "lm-studio",
     }
+
+
+def _normalize_profile(profile, fallback_name="Local LM Studio"):
+    defaults = default_llm_settings()
+    raw = {**defaults, **(profile or {})}
+    name = str(raw.get("profile_name") or raw.get("name") or fallback_name).strip()
+    base_url = str(raw.get("llm_base_url") or raw.get("base_url") or "").strip()
+    model = str(raw.get("llm_model") or raw.get("model") or "").strip()
+    api_key = str(raw.get("llm_api_key") or raw.get("api_key") or "").strip()
+    return {
+        "profile_name": name or fallback_name,
+        "llm_base_url": base_url or defaults["llm_base_url"],
+        "llm_model": model or defaults["llm_model"],
+        "llm_api_key": api_key or defaults["llm_api_key"],
+    }
+
+
+def _settings_with_profiles(saved):
+    defaults = default_llm_settings()
+    saved = saved or {}
+    profiles = []
+    for item in saved.get("llm_profiles", []) or []:
+        if isinstance(item, dict):
+            profiles.append(_normalize_profile(item))
+    active_name = str(saved.get("active_llm_profile") or "").strip()
+    legacy = _normalize_profile(
+        {
+            "profile_name": active_name or saved.get("profile_name"),
+            "llm_base_url": saved.get("llm_base_url"),
+            "llm_model": saved.get("llm_model"),
+            "llm_api_key": saved.get("llm_api_key"),
+        },
+        fallback_name=defaults["profile_name"],
+    )
+    if not profiles:
+        profiles = [legacy]
+    elif not any(item["profile_name"] == legacy["profile_name"] for item in profiles):
+        profiles.insert(0, legacy)
+    active_name = active_name or legacy["profile_name"] or profiles[0]["profile_name"]
+    active = next(
+        (item for item in profiles if item["profile_name"] == active_name),
+        profiles[0],
+    )
+    return {
+        **saved,
+        **active,
+        "active_llm_profile": active["profile_name"],
+        "llm_profiles": profiles,
+    }
+
+
+def load_settings():
+    defaults = _settings_with_profiles({})
     if not SETTINGS_PATH.is_file():
         return defaults
     try:
         saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return defaults
-    return {**defaults, **saved}
+    return _settings_with_profiles(saved)
 
 
 def save_settings(settings):
+    settings = _settings_with_profiles(settings)
     temporary = SETTINGS_PATH.with_suffix(".json.tmp")
     temporary.write_text(
         json.dumps(settings, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     temporary.replace(SETTINGS_PATH)
+
+
+def llm_profiles():
+    settings = load_settings()
+    return {
+        "active_llm_profile": settings["active_llm_profile"],
+        "profiles": settings["llm_profiles"],
+    }
+
+
+def save_llm_profile(profile, make_active=True):
+    settings = load_settings()
+    normalized = _normalize_profile(profile)
+    profiles = [
+        item
+        for item in settings.get("llm_profiles", [])
+        if item["profile_name"] != normalized["profile_name"]
+    ]
+    profiles.append(normalized)
+    profiles.sort(key=lambda item: item["profile_name"].casefold())
+    active_name = (
+        normalized["profile_name"]
+        if make_active
+        else settings.get("active_llm_profile") or normalized["profile_name"]
+    )
+    active = next(
+        (item for item in profiles if item["profile_name"] == active_name),
+        profiles[0],
+    )
+    settings.update(
+        {
+            **active,
+            "active_llm_profile": active["profile_name"],
+            "llm_profiles": profiles,
+        }
+    )
+    save_settings(settings)
+    return load_settings()
+
+
+def set_active_llm_profile(profile_name):
+    settings = load_settings()
+    profiles = settings.get("llm_profiles", [])
+    active = next(
+        (item for item in profiles if item["profile_name"] == profile_name),
+        None,
+    )
+    if active is None:
+        raise KeyError(profile_name)
+    settings.update(
+        {
+            **active,
+            "active_llm_profile": active["profile_name"],
+            "llm_profiles": profiles,
+        }
+    )
+    save_settings(settings)
+    return load_settings()
+
+
+def delete_llm_profile(profile_name):
+    settings = load_settings()
+    profiles = [
+        item
+        for item in settings.get("llm_profiles", [])
+        if item["profile_name"] != profile_name
+    ]
+    if not profiles:
+        profiles = [default_llm_settings()]
+    active_name = settings.get("active_llm_profile")
+    if active_name == profile_name:
+        active_name = profiles[0]["profile_name"]
+    active = next(
+        (item for item in profiles if item["profile_name"] == active_name),
+        profiles[0],
+    )
+    settings.update(
+        {
+            **active,
+            "active_llm_profile": active["profile_name"],
+            "llm_profiles": profiles,
+        }
+    )
+    save_settings(settings)
+    return load_settings()

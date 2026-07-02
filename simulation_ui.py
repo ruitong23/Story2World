@@ -16,38 +16,180 @@ from app_files import (
     file_status,
     generated_db_path,
     load_settings,
+    save_llm_profile,
+    set_active_llm_profile,
+    delete_llm_profile,
 )
 from step17_runtime import load_step17_runtime
+from llm_api import chat_completion, list_models, token_usage_summary
 
 
 def make_llm_callable(base_url, model, api_key):
     def call_llm(system_prompt, user_prompt, temperature=0.2, max_tokens=4096):
-        request = urllib.request.Request(
-            base_url.rstrip("/") + "/chat/completions",
-            data=json.dumps(
-                {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "stream": False,
-                },
-                ensure_ascii=False,
-            ).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
+        return chat_completion(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            source="desktop_simulation",
+            flow="step17_runtime",
+            timeout=900,
         )
-        with urllib.request.urlopen(request, timeout=900) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        return payload["choices"][0]["message"]["content"].strip()
 
     return call_llm
+
+
+class LLMProfileDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("LLM API Profile")
+        self.resizable(False, False)
+        self.result = None
+        saved = load_settings()
+        self.profiles = saved.get("llm_profiles", [])
+        self.profile_name = tk.StringVar(value=saved["active_llm_profile"])
+        self.base_url = tk.StringVar(value=saved["llm_base_url"])
+        self.model = tk.StringVar(value=saved["llm_model"])
+        self.api_key = tk.StringVar(value=saved["llm_api_key"])
+        self.status_text = tk.StringVar(
+            value="Select or edit the OpenAI-compatible API used by simulation."
+        )
+
+        outer = ttk.Frame(self, padding=14)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(1, weight=1)
+        ttk.Label(outer, text="Saved profile").grid(row=0, column=0, sticky="w")
+        self.profile_combo = ttk.Combobox(
+            outer,
+            textvariable=self.profile_name,
+            values=[item["profile_name"] for item in self.profiles],
+            width=42,
+        )
+        self.profile_combo.grid(row=0, column=1, sticky="ew", padx=8)
+        self.profile_combo.bind("<<ComboboxSelected>>", self._profile_selected)
+        ttk.Label(outer, text="Base URL").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(outer, textvariable=self.base_url, width=48).grid(
+            row=1, column=1, columnspan=2, sticky="ew", padx=8, pady=(8, 0)
+        )
+        ttk.Label(outer, text="Model").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.model_combo = ttk.Combobox(outer, textvariable=self.model)
+        self.model_combo.grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=8, pady=(8, 0)
+        )
+        ttk.Label(outer, text="API key").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(outer, textvariable=self.api_key, show="*").grid(
+            row=3, column=1, columnspan=2, sticky="ew", padx=8, pady=(8, 0)
+        )
+        ttk.Label(outer, textvariable=self.status_text, foreground="#5f6f6a").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(10, 0)
+        )
+        actions = ttk.Frame(outer)
+        actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        ttk.Button(actions, text="Save profile", command=self._save_profile).pack(
+            side="left"
+        )
+        ttk.Button(actions, text="Delete", command=self._delete_profile).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(actions, text="Check server", command=self._check_server).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(actions, text="Start simulation", command=self._accept).pack(
+            side="right"
+        )
+        ttk.Button(actions, text="Cancel", command=self._cancel).pack(
+            side="right", padx=(0, 8)
+        )
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.transient(parent)
+        self.grab_set()
+        self.wait_visibility()
+        self.focus_set()
+
+    def _current_profile(self):
+        name = self.profile_name.get().strip() or self.model.get().strip()
+        base_url = self.base_url.get().strip()
+        model = self.model.get().strip()
+        api_key = self.api_key.get().strip() or "lm-studio"
+        if not base_url or not model:
+            raise ValueError("LLM base URL and model are required.")
+        return {
+            "profile_name": name or "Local LM Studio",
+            "llm_base_url": base_url,
+            "llm_model": model,
+            "llm_api_key": api_key,
+        }
+
+    def _refresh(self, saved):
+        self.profiles = saved.get("llm_profiles", [])
+        self.profile_combo.configure(
+            values=[item["profile_name"] for item in self.profiles]
+        )
+        self.profile_name.set(saved["active_llm_profile"])
+        self.base_url.set(saved["llm_base_url"])
+        self.model.set(saved["llm_model"])
+        self.api_key.set(saved["llm_api_key"])
+
+    def _profile_selected(self, _event=None):
+        try:
+            self._refresh(set_active_llm_profile(self.profile_name.get().strip()))
+        except KeyError:
+            pass
+
+    def _save_profile(self):
+        try:
+            self._refresh(save_llm_profile(self._current_profile(), make_active=True))
+            self.status_text.set("Profile saved.")
+        except Exception as error:
+            messagebox.showerror("LLM profile", str(error), parent=self)
+
+    def _delete_profile(self):
+        name = self.profile_name.get().strip()
+        if not name:
+            return
+        if messagebox.askyesno("LLM profile", f"Delete profile '{name}'?", parent=self):
+            self._refresh(delete_llm_profile(name))
+            self.status_text.set("Profile deleted.")
+
+    def _check_server(self):
+        try:
+            models = list_models(
+                self.base_url.get().strip(),
+                self.api_key.get().strip(),
+            )
+            self.model_combo.configure(values=models)
+            selected = self.model.get().strip()
+            if selected in models:
+                self.status_text.set(f"Server online. Selected model found: {selected}")
+            elif models:
+                self.model.set(models[0])
+                self.status_text.set(
+                    f"Server online. Select a model from {len(models)} available models."
+                )
+            else:
+                self.status_text.set("Server online, but no models were listed.")
+        except Exception as error:
+            self.status_text.set(f"Server check failed: {error}")
+
+    def _accept(self):
+        try:
+            self.result = save_llm_profile(
+                self._current_profile(),
+                make_active=True,
+            )
+        except Exception as error:
+            messagebox.showerror("LLM profile", str(error), parent=self)
+            return
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 class SimulationApp:
@@ -61,7 +203,12 @@ class SimulationApp:
         self.selected_character_id = None
         self.start_percent = tk.DoubleVar(value=0.0)
 
-        saved = load_settings()
+        dialog = LLMProfileDialog(root)
+        root.wait_window(dialog)
+        if dialog.result is None:
+            root.destroy()
+            return
+        saved = dialog.result
         self.base_url = os.getenv("NOVEL_LLM_BASE_URL", saved["llm_base_url"])
         self.model = os.getenv("NOVEL_LLM_MODEL", saved["llm_model"])
         self.api_key = (
@@ -80,16 +227,16 @@ class SimulationApp:
         )
         self.store = self.runtime["store"]
         self.orchestrator = self.runtime["orchestrator"]
-        self.catalog = sorted(
-            self.orchestrator.agent_catalog(),
-            key=lambda item: item.get("canonical_name", "").casefold(),
-        )
-        self.catalog_by_id = {
-            item["character_id"]: item for item in self.catalog
-        }
         self.character_by_id = {
             item["character_id"]: item
             for item in self.runtime["character_db"].get("characters", [])
+        }
+        self.catalog = sorted(
+            self.orchestrator.agent_catalog(),
+            key=self._catalog_sort_key,
+        )
+        self.catalog_by_id = {
+            item["character_id"]: item for item in self.catalog
         }
         self.filtered_catalog = list(self.catalog)
         self.list_ids = []
@@ -109,6 +256,29 @@ class SimulationApp:
         self._refresh_runtime_status()
         self._show_latest_story(prefer_recovery=True)
         self.root.after(100, self._drain_events)
+
+    def _catalog_sort_key(self, item):
+        character = self.runtime["character_db"].get("character_by_id", {}).get(
+            item.get("character_id"), {}
+        )
+        if not character:
+            character = self.character_by_id.get(item.get("character_id"), {})
+        tier_score = {"full": 3, "light": 2, "reference": 1}.get(
+            item.get("tier"), 0
+        )
+        data_score = (
+            tier_score * 1000
+            + len(character.get("all_relations", [])) * 20
+            + len(character.get("abilities", [])) * 15
+            + (
+                len(character.get("owned_items", []))
+                + len(character.get("used_items", []))
+            )
+            * 10
+            + len(character.get("evidence_refs", []))
+            + len(character.get("source_chunk_ids", []))
+        )
+        return (-data_score, item.get("canonical_name", "").casefold())
 
     def _build_ui(self):
         outer = ttk.Frame(self.root, padding=10)
@@ -202,6 +372,11 @@ class SimulationApp:
             text="Preview DB anchor",
             command=self.preview_db_anchor,
         ).grid(row=5, column=2, padx=(8, 0), pady=(6, 0), sticky="e")
+        ttk.Button(
+            runtime_frame,
+            text="Token usage",
+            command=self.show_token_usage,
+        ).grid(row=5, column=1, padx=(8, 0), pady=(6, 0), sticky="e")
 
         notebook = ttk.Notebook(right)
         notebook.grid(row=1, column=0, pady=(8, 0), sticky="nsew")
@@ -262,6 +437,32 @@ class SimulationApp:
                 "end", f"{item.get('canonical_name', '?')}  [{tier}]"
             )
             self.list_ids.append(item["character_id"])
+
+    def show_token_usage(self):
+        usage = token_usage_summary(limit=80)
+        lines = [
+            "Token usage from recorded LLM calls",
+            "",
+            f"Calls: {usage['totals']['call_count']}",
+            f"Prompt tokens: {usage['totals']['prompt_tokens']}",
+            f"Completion tokens: {usage['totals']['completion_tokens']}",
+            f"Total tokens: {usage['totals']['total_tokens']}",
+            "",
+            "By source:",
+        ]
+        for item in usage.get("by_source", [])[:12]:
+            lines.append(
+                f"- {item['name']}: {item['total_tokens']} tokens / {item['call_count']} calls"
+            )
+        lines.append("")
+        lines.append("By model:")
+        for item in usage.get("by_model", [])[:12]:
+            lines.append(
+                f"- {item['name']}: {item['total_tokens']} tokens / {item['call_count']} calls"
+            )
+        lines.append("")
+        lines.append(f"Log file: {usage.get('path')}")
+        messagebox.showinfo("Token usage", "\n".join(lines), parent=self.root)
 
     def _restore_active_character(self):
         scene = self.store.runtime.get("active_scene") or {}

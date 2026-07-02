@@ -20,8 +20,12 @@ from app_files import (
     file_status,
     load_settings,
     save_settings,
+    save_llm_profile,
+    set_active_llm_profile,
+    delete_llm_profile,
 )
 from novel_text_io import read_novel_txt
+from llm_api import chat_completion, list_models, token_usage_summary
 
 
 class PreparationApp:
@@ -44,6 +48,7 @@ class PreparationApp:
         self.overlap = tk.StringVar(value="300")
         self.chunk_limit = tk.StringVar(value="10")
         saved = load_settings()
+        self.profile_name = tk.StringVar(value=saved["active_llm_profile"])
         self.base_url = tk.StringVar(
             value=os.getenv("NOVEL_LLM_BASE_URL", saved["llm_base_url"])
         )
@@ -57,6 +62,8 @@ class PreparationApp:
         self.eta_text = tk.StringVar(value="ETA: --")
         self.progress_value = tk.DoubleVar(value=0.0)
         self.preview_button = None
+        self.profile_combo = None
+        self.llm_profiles = saved.get("llm_profiles", [])
 
         self._build_ui()
         self.refresh_file_checks()
@@ -121,20 +128,42 @@ class PreparationApp:
         llm = ttk.LabelFrame(outer, text="OpenAI-compatible local LLM", padding=10)
         llm.grid(row=1, column=0, pady=10, sticky="ew")
         llm.columnconfigure(1, weight=1)
-        ttk.Label(llm, text="Base URL").grid(row=0, column=0, sticky="w")
-        ttk.Entry(llm, textvariable=self.base_url).grid(
-            row=0, column=1, padx=8, sticky="ew"
+        ttk.Label(llm, text="Saved profile").grid(row=0, column=0, sticky="w")
+        self.profile_combo = ttk.Combobox(
+            llm,
+            textvariable=self.profile_name,
+            values=[item["profile_name"] for item in self.llm_profiles],
         )
-        ttk.Label(llm, text="Model").grid(row=1, column=0, pady=(8, 0), sticky="w")
-        ttk.Entry(llm, textvariable=self.model).grid(
+        self.profile_combo.grid(row=0, column=1, padx=8, sticky="ew")
+        self.profile_combo.bind("<<ComboboxSelected>>", self._profile_selected)
+        profile_actions = ttk.Frame(llm)
+        profile_actions.grid(row=0, column=2, sticky="e")
+        ttk.Button(
+            profile_actions,
+            text="Save profile",
+            command=self.save_current_profile,
+        ).pack(side="left")
+        ttk.Button(
+            profile_actions,
+            text="Delete",
+            command=self.delete_current_profile,
+        ).pack(side="left", padx=(6, 0))
+
+        ttk.Label(llm, text="Base URL").grid(row=1, column=0, pady=(8, 0), sticky="w")
+        ttk.Entry(llm, textvariable=self.base_url).grid(
             row=1, column=1, padx=8, pady=(8, 0), sticky="ew"
         )
-        ttk.Label(llm, text="API key").grid(row=2, column=0, pady=(8, 0), sticky="w")
-        ttk.Entry(llm, textvariable=self.api_key, show="*").grid(
+        ttk.Label(llm, text="Model").grid(row=2, column=0, pady=(8, 0), sticky="w")
+        self.model_combo = ttk.Combobox(llm, textvariable=self.model)
+        self.model_combo.grid(
             row=2, column=1, padx=8, pady=(8, 0), sticky="ew"
         )
+        ttk.Label(llm, text="API key").grid(row=3, column=0, pady=(8, 0), sticky="w")
+        ttk.Entry(llm, textvariable=self.api_key, show="*").grid(
+            row=3, column=1, padx=8, pady=(8, 0), sticky="ew"
+        )
         ttk.Button(llm, text="Check server", command=self.check_server).grid(
-            row=0, column=2, rowspan=3, padx=(8, 0)
+            row=1, column=2, rowspan=3, padx=(8, 0), sticky="nsew"
         )
 
         status = ttk.LabelFrame(outer, text="Skeleton graph preparation progress", padding=10)
@@ -202,6 +231,9 @@ class PreparationApp:
         ttk.Button(actions, text="Open output folder", command=self.open_folder).pack(
             side="left"
         )
+        ttk.Button(actions, text="Token usage", command=self.show_token_usage).pack(
+            side="left", padx=(8, 0)
+        )
 
     def choose_novel(self):
         path = filedialog.askopenfilename(
@@ -210,6 +242,63 @@ class PreparationApp:
         )
         if path:
             self.novel_path.set(path)
+
+    def _profile_selected(self, _event=None):
+        name = self.profile_name.get().strip()
+        try:
+            saved = set_active_llm_profile(name)
+        except KeyError:
+            return
+        self.llm_profiles = saved.get("llm_profiles", [])
+        self.profile_name.set(saved["active_llm_profile"])
+        self.base_url.set(saved["llm_base_url"])
+        self.model.set(saved["llm_model"])
+        self.api_key.set(saved["llm_api_key"])
+
+    def _refresh_profile_combo(self, saved):
+        self.llm_profiles = saved.get("llm_profiles", [])
+        if self.profile_combo is not None:
+            self.profile_combo.configure(
+                values=[item["profile_name"] for item in self.llm_profiles]
+            )
+        self.profile_name.set(saved["active_llm_profile"])
+
+    def save_current_profile(self):
+        try:
+            profile = self._current_profile()
+            saved = save_llm_profile(profile, make_active=True)
+            self._refresh_profile_combo(saved)
+            self.events.put(("dialog", ("LLM profile", "Profile saved.", "info")))
+        except Exception as error:
+            messagebox.showerror("LLM profile", str(error))
+
+    def delete_current_profile(self):
+        name = self.profile_name.get().strip()
+        if not name:
+            return
+        if not messagebox.askyesno("LLM profile", f"Delete profile '{name}'?"):
+            return
+        saved = delete_llm_profile(name)
+        self._refresh_profile_combo(saved)
+        self.base_url.set(saved["llm_base_url"])
+        self.model.set(saved["llm_model"])
+        self.api_key.set(saved["llm_api_key"])
+
+    def _current_profile(self):
+        name = self.profile_name.get().strip() or self.model.get().strip()
+        if not name:
+            name = "Local LM Studio"
+        base_url = self.base_url.get().strip()
+        model = self.model.get().strip()
+        api_key = self.api_key.get().strip() or "lm-studio"
+        if not base_url or not model:
+            raise ValueError("LLM base URL and model are required.")
+        return {
+            "profile_name": name,
+            "llm_base_url": base_url,
+            "llm_model": model,
+            "llm_api_key": api_key,
+        }
 
     def _slider_changed(self, value):
         self.percent_entry.set(str(round(float(value), 1)).rstrip("0").rstrip("."))
@@ -244,20 +333,23 @@ class PreparationApp:
     def check_server(self):
         def worker():
             try:
-                url = self.base_url.get().rstrip("/") + "/models"
-                request = urllib.request.Request(
-                    url,
-                    headers={"Authorization": f"Bearer {self.api_key.get()}"},
+                models = list_models(
+                    self.base_url.get().strip(),
+                    self.api_key.get().strip(),
                 )
-                with urllib.request.urlopen(request, timeout=8) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                models = [item.get("id", "") for item in payload.get("data", [])]
                 selected = self.model.get()
+                self.events.put(("models", models))
                 detail = (
                     f"Server online. Selected model found: {selected}"
                     if selected in models
-                    else f"Server online, but '{selected}' was not listed."
+                    else (
+                        f"Server online. Select a model from {len(models)} available models."
+                        if models
+                        else "Server online, but no models were listed."
+                    )
                 )
+                if selected not in models and models:
+                    self.events.put(("set_model", models[0]))
                 self.events.put(("dialog", ("LLM server", detail, "info")))
             except Exception as error:
                 self.events.put(
@@ -267,30 +359,20 @@ class PreparationApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _call_llm_text(self, system_prompt, user_prompt, max_tokens=900):
-        request = urllib.request.Request(
-            self.base_url.get().strip().rstrip("/") + "/chat/completions",
-            data=json.dumps(
-                {
-                    "model": self.model.get().strip(),
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": max_tokens,
-                    "stream": False,
-                },
-                ensure_ascii=False,
-            ).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key.get().strip() or 'lm-studio'}",
-            },
-            method="POST",
+        return chat_completion(
+            base_url=self.base_url.get().strip(),
+            api_key=self.api_key.get().strip() or "lm-studio",
+            model=self.model.get().strip(),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=max_tokens,
+            source="desktop_prepare",
+            flow="source_preview",
+            timeout=180,
         )
-        with urllib.request.urlopen(request, timeout=180) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        return payload["choices"][0]["message"]["content"].strip()
 
     def _source_excerpt_for_scope(self, novel, percent, window=3000):
         text = read_novel_txt(novel)
@@ -415,21 +497,18 @@ class PreparationApp:
             "--chunk-limit",
             str(chunk_limit),
         ]
+        profile = self._current_profile()
+        saved = save_llm_profile(profile, make_active=True)
+        self._refresh_profile_combo(saved)
         env = os.environ.copy()
-        env["NOVEL_LLM_BASE_URL"] = self.base_url.get().strip()
-        env["NOVEL_LLM_MODEL"] = self.model.get().strip()
-        env["NOVEL_LLM_API_KEY"] = self.api_key.get().strip() or "lm-studio"
+        env["NOVEL_LLM_BASE_URL"] = profile["llm_base_url"]
+        env["NOVEL_LLM_MODEL"] = profile["llm_model"]
+        env["NOVEL_LLM_API_KEY"] = profile["llm_api_key"]
         self.api_key.set(env["NOVEL_LLM_API_KEY"])
         env["PYTHONIOENCODING"] = "utf-8"
         env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
         env.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-        save_settings(
-            {
-                "llm_base_url": env["NOVEL_LLM_BASE_URL"],
-                "llm_model": env["NOVEL_LLM_MODEL"],
-                "llm_api_key": env["NOVEL_LLM_API_KEY"],
-            }
-        )
+        save_settings(saved)
 
         self.progress_value.set(0)
         self.stage_text.set("Starting preparation...")
@@ -545,6 +624,10 @@ class PreparationApp:
                 event, payload = self.events.get_nowait()
                 if event == "log":
                     self.append_log(payload)
+                elif event == "models":
+                    self.model_combo.configure(values=payload)
+                elif event == "set_model":
+                    self.model.set(payload)
                 elif event == "progress":
                     self._set_progress(payload)
                 elif event == "finished":
@@ -620,6 +703,26 @@ class PreparationApp:
             os.startfile(APP_DIR)
         except Exception as error:
             messagebox.showerror("Open folder", str(error))
+
+    def show_token_usage(self):
+        usage = token_usage_summary(limit=80)
+        lines = [
+            "Token usage from recorded LLM calls",
+            "",
+            f"Calls: {usage['totals']['call_count']}",
+            f"Prompt tokens: {usage['totals']['prompt_tokens']}",
+            f"Completion tokens: {usage['totals']['completion_tokens']}",
+            f"Total tokens: {usage['totals']['total_tokens']}",
+            "",
+            "By source:",
+        ]
+        for item in usage.get("by_source", [])[:12]:
+            lines.append(
+                f"- {item['name']}: {item['total_tokens']} tokens / {item['call_count']} calls"
+            )
+        lines.append("")
+        lines.append(f"Log file: {usage.get('path')}")
+        messagebox.showinfo("Token usage", "\n".join(lines), parent=self.root)
 
 
 def main():

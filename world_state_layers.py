@@ -98,9 +98,17 @@ def unique(values):
     result = []
     seen = set()
     for value in values:
-        if value in (None, "") or value in seen:
+        if value in (None, ""):
             continue
-        seen.add(value)
+        marker = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if marker in seen:
+            continue
+        seen.add(marker)
         result.append(value)
     return result
 

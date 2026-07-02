@@ -787,6 +787,8 @@ try:
 except ImportError:
     OpenAI = None
 
+from llm_api import chat_completion
+
 
 def load_pipeline_settings():
     settings_path = Path(__file__).resolve().parent / "settings.json"
@@ -848,43 +850,21 @@ def _call_llm_http(
     system_prompt, user_prompt, model, temperature, max_tokens,
     json_mode=True,
 ):
-    payload = {
-        "model": model,
-        "messages": [
+    return chat_completion(
+        base_url=LLM_BASE_URL,
+        api_key=LLM_API_KEY,
+        model=model,
+        messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if json_mode:
-        payload["response_format"] = LLM_JSON_RESPONSE_FORMAT
-    request = urllib.request.Request(
-        f"{LLM_BASE_URL}/chat/completions",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {LLM_API_KEY}",
-        },
-        method="POST",
+        temperature=temperature,
+        max_tokens=max_tokens,
+        source="desktop_pipeline",
+        flow="graph_and_db_generation",
+        response_format=LLM_JSON_RESPONSE_FORMAT if json_mode else None,
+        timeout=300,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=300) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        try:
-            error_payload = json.loads(detail)
-            generated_text = str(error_payload.get("error", ""))
-        except json.JSONDecodeError:
-            generated_text = detail
-        fence_start = generated_text.find("```")
-        json_start = generated_text.find("{")
-        recovery_start = fence_start if fence_start >= 0 else json_start
-        if recovery_start >= 0:
-            return generated_text[recovery_start:].strip()
-        raise RuntimeError(f"LLM HTTP {error.code}: {detail}") from error
-    return body["choices"][0]["message"]["content"].strip()
 
 
 def call_llm(
@@ -900,24 +880,6 @@ def call_llm(
     last_error = None
     for attempt in range(retry):
         try:
-            if llm_client is not None:
-                request_options = {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                }
-                if json_mode:
-                    request_options["response_format"] = (
-                        LLM_JSON_RESPONSE_FORMAT
-                    )
-                response = llm_client.chat.completions.create(
-                    **request_options,
-                )
-                return response.choices[0].message.content.strip()
             return _call_llm_http(
                 system_prompt,
                 user_prompt,
