@@ -1,4 +1,0 @@
--r ../navelmaker2_desktop/requirements.txt
-fastapi>=0.115
-python-multipart>=0.0.9
-uvicorn[standard]>=0.30
