@@ -50,7 +50,7 @@ is expected to come from later aggregation and retrieval over source refs.
 Command:
 
 ```powershell
-python -u .\pipeline_program.py --novel "C:\Users\ruitongs\Downloads\《斗罗大陆》_qinkan.net.txt" --percent 100 --chunk-size 3000 --overlap 300 --chunk-limit 10
+python -u .\pipeline_program.py --novel "C:\path\to\novel.txt" --percent 100 --chunk-size 3000 --overlap 300 --chunk-limit 10
 ```
 
 Result:

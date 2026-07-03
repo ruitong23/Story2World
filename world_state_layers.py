@@ -51,9 +51,11 @@ EXCLUSIVE_MARKERS = {
     "唯一",
     "本命",
     "天赋",
-    "武魂",
-    "魂环",
-    "魂骨",
+    "专属能力",
+    "核心能力",
+    "契约",
+    "印记",
+    "本源",
     "体内",
     "自身",
     "变异",
@@ -328,7 +330,7 @@ def build_resource_record(entity, relations, entity_by_id):
         conditions["acquisition_conditions"].append(
             condition_record(
                 "exclusive_restriction",
-                "专属型资源：只有满足原著证据中的角色、血脉、身份、武魂或同等限制时可获得。",
+                "专属型资源：只有满足原著证据中的角色、血脉、身份、专属能力或同等限制时可获得。",
                 [item["relation_id"] for item in related],
                 canonical_owner_ids,
                 [first_acquisition_order],
@@ -1846,39 +1848,25 @@ def build_runtime_relationship_db(simulation_state_db, canonical_relationship_db
 
 
 def build_motivation_action_policy(core, objectives, fears, strategies):
-    text = "；".join(
-        str(item).strip()
-        for item in [
-            *core.get("root_drives", []),
-            *objectives,
-            *fears,
-            *strategies,
-            *core.get("temptations", []),
-            *core.get("trigger_rules", []),
-        ]
-        if str(item).strip()
+    pursues_target = bool(
+        core.get("root_drives", [])
+        or objectives
+        or core.get("temptations", [])
     )
-    pursues_tang = "唐僧" in text or "唐僧肉" in text
-    has_high_threat = any(
-        word in text
-        for word in ("孙悟空", "悟空", "火眼金睛", "识破", "暴露", "降伏", "诛杀")
-    )
-    uses_disguise = any(
-        word in text
-        for word in ("伪装", "变身", "化身", "临时身份", "骗", "诱")
-    )
+    has_high_threat = bool(fears)
+    uses_strategy = bool(strategies or core.get("trigger_rules", []))
     forward_actions = ["观察", "试探", "换策略", "保留下一步机会"]
-    if uses_disguise:
-        forward_actions.extend(["维护伪装", "变换身份", "制造误判"])
-    if pursues_tang:
-        forward_actions.extend(["接近唐僧", "诱导唐僧", "分散护卫注意"])
+    if uses_strategy:
+        forward_actions.extend(["维护当前策略", "调整身份呈现", "制造误判"])
+    if pursues_target:
+        forward_actions.extend(["推进当前目标", "试探相关对象", "分散阻碍注意"])
     if has_high_threat:
-        forward_actions.extend(["绕开孙悟空视线", "拉开风险距离", "等待护卫破绽"])
+        forward_actions.extend(["绕开威胁视线", "拉开风险距离", "等待防线破绽"])
     return {
-        "priority": "根本欲望决定方向；恐惧只改变路线、节奏和伪装强度。",
+        "priority": "根本欲望决定方向；恐惧只改变路线、节奏和策略强度。",
         "when_threatened": (
-            "高威胁下先隐蔽推进核心目标：维护伪装、换身份、转移视线、"
-            "分散威胁、试探目标或制造机会；暂避必须同时保留下一步机会。"
+            "高威胁下先隐蔽推进核心目标：维护当前策略、调整身份呈现、转移视线、"
+            "分散威胁、试探相关对象或制造机会；暂避必须同时保留下一步机会。"
         ),
         "stall_guard": (
             "除非玩家明确要求或角色被外力限制，不要整轮只屏息、僵住、"
@@ -1886,7 +1874,7 @@ def build_motivation_action_policy(core, objectives, fears, strategies):
         ),
         "action_bias": (
             "risk_managed_pursuit"
-            if pursues_tang and has_high_threat
+            if pursues_target and has_high_threat
             else "goal_directed_survival"
         ),
         "forward_actions": list(dict.fromkeys(forward_actions))[:12],
@@ -1910,21 +1898,12 @@ def build_runtime_motivation_state(agent_profiles):
         strategies = core.get("strategy_identities") or core.get(
             "strategy_patterns", []
         )
-        text = "；".join(
-            str(item)
-            for item in [
-                *core.get("root_drives", []),
-                *current_objectives,
-                *fears,
-                *strategies,
-                *core.get("temptations", []),
-            ]
+        pursues_target = bool(
+            core.get("root_drives")
+            or current_objectives
+            or core.get("temptations")
         )
-        pursues_tang = "唐僧" in text or "唐僧肉" in text
-        has_disguise = any(
-            "伪装" in str(item) or "变身" in str(item)
-            for item in strategies
-        )
+        has_strategy = bool(strategies)
         action_policy = core.get("action_policy") or build_motivation_action_policy(
             core,
             current_objectives,
@@ -1938,15 +1917,19 @@ def build_runtime_motivation_state(agent_profiles):
             "active_fear": (fears or [""])[0],
             "current_strategy": (strategies or [""])[0],
             "desire_intensity": (
-                55 if pursues_tang else 35 if core.get("root_drives") else 10
+                55 if pursues_target else 35 if core.get("root_drives") else 10
             ),
             "fear_intensity": (
-                35 if pursues_tang and fears else 25 if fears else 5
+                35 if pursues_target and fears else 25 if fears else 5
             ),
             "attachment_focus": (core.get("attachments") or [""])[0],
             "temptation_focus": (core.get("temptations") or [""])[0],
             "disguise_pressure": (
-                55 if pursues_tang and has_disguise else 35 if has_disguise
+                55 if pursues_target and has_strategy else 35 if has_strategy
+                else 0
+            ),
+            "strategy_pressure": (
+                55 if pursues_target and has_strategy else 35 if has_strategy
                 else 0
             ),
             "action_policy": action_policy,
@@ -1958,7 +1941,7 @@ def build_runtime_motivation_state(agent_profiles):
     output = {
         "schema_version": LAYER_SCHEMA_VERSION,
         "layer": "Runtime Motivation State",
-        "purpose": "Mutable desire, fear, strategy and disguise pressure for runtime agents.",
+        "purpose": "Mutable desire, fear and strategy pressure for runtime agents.",
         "states": states,
         "policy": {
             "canonical_core_motivation_is_template": True,
