@@ -24,3 +24,14 @@
 !/simulation_ui.py
 !/step17_runtime.py
 !/world_state_layers.py
+
+# Preserve the original development utility and empty database layout.
+!/export_notebook_pipeline.py
+!/db/
+/db/**
+!/db/**/
+!/db/agents/.gitkeep
+!/db/agents/runtime_agent_dbs/.gitkeep
+!/db/canonical/.gitkeep
+!/db/graph/.gitkeep
+!/db/runtime/.gitkeep
