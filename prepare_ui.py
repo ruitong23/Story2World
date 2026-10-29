@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import queue
 import subprocess
@@ -31,7 +32,7 @@ from llm_api import chat_completion, list_models, token_usage_summary
 class PreparationApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("NavelMaker 2 - Skeleton Graph Preparation")
+        self.root.title("Story2World - 小说世界准备")
         self.root.geometry("1040x760")
         self.root.minsize(900, 650)
 
@@ -46,7 +47,7 @@ class PreparationApp:
         self.percent_entry = tk.StringVar(value="100")
         self.chunk_size = tk.StringVar(value="3000")
         self.overlap = tk.StringVar(value="300")
-        self.chunk_limit = tk.StringVar(value="10")
+        self.chunk_limit = tk.StringVar(value="0")
         saved = load_settings()
         self.profile_name = tk.StringVar(value=saved["active_llm_profile"])
         self.base_url = tk.StringVar(
@@ -60,6 +61,7 @@ class PreparationApp:
         )
         self.stage_text = tk.StringVar(value="Ready")
         self.eta_text = tk.StringVar(value="ETA: --")
+        self.checkpoint_text = tk.StringVar(value="Checkpoint: checking...")
         self.progress_value = tk.DoubleVar(value=0.0)
         self.preview_button = None
         self.profile_combo = None
@@ -181,6 +183,12 @@ class PreparationApp:
         ttk.Label(status, textvariable=self.eta_text).grid(
             row=1, column=1, pady=(6, 0), sticky="e"
         )
+        ttk.Label(
+            status,
+            textvariable=self.checkpoint_text,
+            foreground="#5f6f6a",
+            wraplength=900,
+        ).grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky="w")
 
         lower = ttk.Panedwindow(outer, orient="horizontal")
         lower.grid(row=3, column=0, pady=(10, 0), sticky="nsew")
@@ -228,8 +236,13 @@ class PreparationApp:
         ttk.Button(actions, text="Refresh file checks", command=self.refresh_file_checks).pack(
             side="left", padx=8
         )
+        ttk.Button(
+            actions,
+            text="Checkpoint details",
+            command=self.show_checkpoint_details,
+        ).pack(side="left")
         ttk.Button(actions, text="Open output folder", command=self.open_folder).pack(
-            side="left"
+            side="left", padx=(8, 0)
         )
         ttk.Button(actions, text="Token usage", command=self.show_token_usage).pack(
             side="left", padx=(8, 0)
@@ -300,6 +313,10 @@ class PreparationApp:
             "llm_api_key": api_key,
         }
 
+    def show_checkpoint_details(self):
+        self.refresh_file_checks()
+        self._show_text_window("Checkpoint details", self.checkpoint_detail_text())
+
     def _slider_changed(self, value):
         self.percent_entry.set(str(round(float(value), 1)).rstrip("0").rstrip("."))
 
@@ -317,6 +334,155 @@ class PreparationApp:
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _checkpoint_paths(self):
+        return [
+            APP_DIR / "raw_graph_triples.json",
+            APP_DIR / "db" / "graph" / "raw_graph_triples.json",
+        ]
+
+    def _load_step9_checkpoint(self, path):
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {
+                "path": path,
+                "readable": False,
+                "summary": "unreadable checkpoint",
+            }
+        results = data.get("results", []) if isinstance(data, dict) else []
+        if not isinstance(results, list):
+            results = []
+        empty_ids = []
+        partial_ids = []
+        validation_error_count = 0
+        node_count = 0
+        edge_count = 0
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            nodes = item.get("nodes", [])
+            edges = item.get("edges", [])
+            node_count += len(nodes) if isinstance(nodes, list) else 0
+            edge_count += len(edges) if isinstance(edges, list) else 0
+            if not nodes and not edges:
+                empty_ids.append(item.get("chunk_id"))
+            if item.get("validation_status") == "partial":
+                partial_ids.append(item.get("chunk_id"))
+            validation_error_count += len(item.get("validation_errors", []) or [])
+        quality = data.get("quality_summary", {}) if isinstance(data, dict) else {}
+        return {
+            "path": path,
+            "readable": True,
+            "schema_version": data.get("schema_version"),
+            "source_text_fingerprint": data.get("source_text_fingerprint"),
+            "ontology_fingerprint": data.get("ontology_fingerprint"),
+            "expected": data.get("expected_chunk_count", len(results)),
+            "available": data.get("available_source_chunk_count"),
+            "done": len(results),
+            "complete": bool(data.get("complete")),
+            "valid": quality.get("valid_chunk_count"),
+            "partial": quality.get("partial_chunk_count", len(partial_ids)),
+            "validation_errors": quality.get(
+                "validation_error_count",
+                validation_error_count,
+            ),
+            "nodes": quality.get("node_count", node_count),
+            "edges": quality.get("edge_count", edge_count),
+            "empty_ids": empty_ids,
+            "partial_ids": partial_ids,
+            "modified": path.stat().st_mtime,
+        }
+
+    def _current_source_fingerprint(self):
+        novel_path = self.novel_path.get().strip()
+        if not novel_path:
+            return "", "No source file selected."
+        path = Path(novel_path)
+        if not path.is_file():
+            return "", "Selected source file does not exist."
+        try:
+            text = read_novel_txt(path)
+        except Exception as error:
+            return "", f"Could not read selected source: {error}"
+        return hashlib.sha256(text.encode("utf-8")).hexdigest(), "Source file readable."
+
+    def _best_checkpoint(self):
+        checkpoints = [
+            item
+            for item in (
+                self._load_step9_checkpoint(path)
+                for path in self._checkpoint_paths()
+            )
+            if item
+        ]
+        if not checkpoints:
+            return None, []
+        checkpoints.sort(
+            key=lambda item: (
+                int(item.get("done") or 0),
+                float(item.get("modified") or 0),
+            ),
+            reverse=True,
+        )
+        return checkpoints[0], checkpoints
+
+    def _checkpoint_match_text(self, checkpoint):
+        source_hash, source_status = self._current_source_fingerprint()
+        if not checkpoint:
+            return source_status
+        saved_hash = checkpoint.get("source_text_fingerprint")
+        if not source_hash:
+            return source_status
+        if saved_hash == source_hash:
+            return "Selected source matches this checkpoint."
+        return "Selected source does not match this checkpoint; resume will restart."
+
+    def checkpoint_summary_text(self):
+        checkpoint, _all = self._best_checkpoint()
+        if not checkpoint:
+            return "Checkpoint: none found. A new run will start from chunk 0."
+        match_text = self._checkpoint_match_text(checkpoint)
+        status = "complete" if checkpoint.get("complete") else "incomplete"
+        return (
+            "Checkpoint: "
+            f"{checkpoint['done']}/{checkpoint.get('expected')} chunks, "
+            f"{checkpoint.get('partial', 0)} partial, "
+            f"{len(checkpoint.get('empty_ids', []))} empty, {status}. "
+            f"{match_text} Path: {checkpoint['path']}"
+        )
+
+    def checkpoint_detail_text(self):
+        best, checkpoints = self._best_checkpoint()
+        lines = [
+            "Step 9 checkpoint and resume status",
+            "",
+        ]
+        if not checkpoints:
+            lines.append("No raw_graph_triples.json checkpoint was found.")
+        for index, item in enumerate(checkpoints, start=1):
+            lines.extend([
+                f"Candidate {index}: {item['path']}",
+                f"Readable: {item.get('readable')}",
+                f"Schema: {item.get('schema_version')}",
+                f"Chunks: {item.get('done')}/{item.get('expected')} complete={item.get('complete')}",
+                f"Quality: valid={item.get('valid')} partial={item.get('partial')} errors={item.get('validation_errors')} nodes={item.get('nodes')} edges={item.get('edges')}",
+                f"Empty chunk ids: {item.get('empty_ids')[:80]}",
+                f"Partial chunk ids: {item.get('partial_ids')[:80]}",
+                f"Source match: {self._checkpoint_match_text(item)}",
+                "",
+            ])
+        lines.extend([
+            "Resume rules",
+            "The pipeline can reuse a chunk only when the source novel fingerprint matches, the ontology fingerprint matches, and that chunk text hash still matches.",
+            "The model does not have to be the same. Changing model is allowed, but later chunks may have different extraction style or quality.",
+            "Partial chunks and suspicious empty chunks are not reused; they will be reprocessed.",
+            "If chunk size, overlap, percent, or source text changes, only chunks with matching ids and matching text hashes can be reused.",
+            "Root checkpoint path is preferred. If it is missing, db/graph/raw_graph_triples.json is used as the fallback checkpoint.",
+        ])
+        return "\n".join(lines)
+
     def refresh_file_checks(self):
         self.checks.delete(*self.checks.get_children())
         for item in file_status(PREPARATION_OUTPUTS):
@@ -329,6 +495,7 @@ class PreparationApp:
             )
         self.checks.tag_configure("made", foreground="#137333")
         self.checks.tag_configure("needed", foreground="#b06000")
+        self.checkpoint_text.set(self.checkpoint_summary_text())
 
     def check_server(self):
         def worker():
@@ -504,6 +671,7 @@ class PreparationApp:
         env["NOVEL_LLM_BASE_URL"] = profile["llm_base_url"]
         env["NOVEL_LLM_MODEL"] = profile["llm_model"]
         env["NOVEL_LLM_API_KEY"] = profile["llm_api_key"]
+        env["NOVEL_LLM_THINKING_ENABLED"] = "0"
         self.api_key.set(env["NOVEL_LLM_API_KEY"])
         env["PYTHONIOENCODING"] = "utf-8"
         env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -522,6 +690,11 @@ class PreparationApp:
         self.append_log(f"Novel: {novel}")
         self.append_log(f"Scope: {percent:g}%")
         self.append_log(f"Step 9 chunk limit: {chunk_limit or 'all selected'}")
+        self.append_log(self.checkpoint_summary_text())
+        self.append_log(
+            "Resume requires the same source fingerprint, matching ontology, and matching chunk text hashes. "
+            "Model changes are allowed but may change extraction quality."
+        )
 
         try:
             self.process = subprocess.Popen(
@@ -728,7 +901,7 @@ class PreparationApp:
 def main():
     root = tk.Tk()
     try:
-        root.iconname("NavelMaker")
+        root.iconname("Story2World")
     except tk.TclError:
         pass
     PreparationApp(root)

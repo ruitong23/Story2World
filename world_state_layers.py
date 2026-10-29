@@ -45,21 +45,26 @@ RELATIONSHIP_TYPES = {
 ORG_CHANGE_TYPES = {"BELONGS_TO", "GOVERNS", "AUTHORIZES", "ACTS_UNDER_ORDERS_OF"}
 
 EXCLUSIVE_MARKERS = {
-    "血脉",
-    "血统",
     "专属",
-    "唯一",
-    "本命",
-    "天赋",
-    "专属能力",
-    "核心能力",
-    "契约",
-    "印记",
-    "本源",
-    "体内",
-    "自身",
-    "变异",
-    "继承",
+    "唯一持有",
+    "不可转让",
+    "绑定",
+    "资格限制",
+    "身份限制",
+    "血脉限制",
+    "血统限制",
+    "契约绑定",
+    "access restricted",
+    "exclusive",
+    "unique holder",
+    "non-transferable",
+    "bound to",
+    "requires qualification",
+    "requires identity",
+    "bloodline restricted",
+    "lineage restricted",
+    "contract-bound",
+    "soulbound",
 }
 
 TRANSFER_TYPES = {
@@ -245,8 +250,8 @@ def infer_access_type(entity, related_relations):
                 for text in evidence_texts(relation)
             ],
         ]
-    )
-    if any(marker in haystack for marker in EXCLUSIVE_MARKERS):
+    ).casefold()
+    if any(marker.casefold() in haystack for marker in EXCLUSIVE_MARKERS):
         return "exclusive"
     return "open"
 
@@ -330,7 +335,7 @@ def build_resource_record(entity, relations, entity_by_id):
         conditions["acquisition_conditions"].append(
             condition_record(
                 "exclusive_restriction",
-                "专属型资源：只有满足原著证据中的角色、血脉、身份、专属能力或同等限制时可获得。",
+                "受限型资源：只有满足来源证据明确支持的持有者、身份、资格、绑定关系或其他访问条件时可获得。",
                 [item["relation_id"] for item in related],
                 canonical_owner_ids,
                 [first_acquisition_order],
@@ -367,7 +372,7 @@ def build_resource_record(entity, relations, entity_by_id):
     conditions["upgrade_conditions"].append(
         condition_record(
             "explicit_training_or_unlock",
-            "升级必须由训练、觉醒、学习、战斗、组织授权或规则允许的触发事件提交。",
+            "升级必须由来源证据或运行时裁定明确支持的触发事件提交。",
             [item["relation_id"] for item in related],
             canonical_owner_ids + canonical_user_ids,
             [first_acquisition_order],
@@ -376,7 +381,7 @@ def build_resource_record(entity, relations, entity_by_id):
     conditions["transfer_conditions"].append(
         condition_record(
             "transfer_event_required",
-            "转移当前拥有者必须通过事件、授权、交易、继承、偷取或战斗结果提交，并保留原著拥有者字段。",
+            "转移当前拥有者必须通过来源证据或运行时裁定明确支持的状态变化事件提交，并保留原著拥有者字段。",
             [item["relation_id"] for item in transfer_relations],
             canonical_owner_ids,
             [first_acquisition_order],
@@ -1855,30 +1860,25 @@ def build_motivation_action_policy(core, objectives, fears, strategies):
     )
     has_high_threat = bool(fears)
     uses_strategy = bool(strategies or core.get("trigger_rules", []))
-    forward_actions = ["观察", "试探", "换策略", "保留下一步机会"]
-    if uses_strategy:
-        forward_actions.extend(["维护当前策略", "调整身份呈现", "制造误判"])
-    if pursues_target:
-        forward_actions.extend(["推进当前目标", "试探相关对象", "分散阻碍注意"])
-    if has_high_threat:
-        forward_actions.extend(["绕开威胁视线", "拉开风险距离", "等待防线破绽"])
     return {
-        "priority": "根本欲望决定方向；恐惧只改变路线、节奏和策略强度。",
+        "priority": (
+            "角色行动必须由来源证据、当前动机、约束、关系和场景状态共同决定；"
+            "代码不预设具体动作。"
+        ),
         "when_threatened": (
-            "高威胁下先隐蔽推进核心目标：维护当前策略、调整身份呈现、转移视线、"
-            "分散威胁、试探相关对象或制造机会；暂避必须同时保留下一步机会。"
+            "结合角色资料、风险与当前状态重新评估目标和行动；不预设坚持、放弃或隐蔽策略。"
         ),
         "stall_guard": (
-            "除非玩家明确要求或角色被外力限制，不要整轮只屏息、僵住、"
-            "装死、扮石头或反复描写恐惧；停顿之后必须出现目标导向的判断或动作。"
+            "不要因固定模板让角色重复单一状态；若行动受限，记录限制原因和可见后果。"
         ),
         "action_bias": (
             "risk_managed_pursuit"
             if pursues_target and has_high_threat
             else "goal_directed_survival"
         ),
-        "forward_actions": list(dict.fromkeys(forward_actions))[:12],
-        "risk_can_override_goal": False,
+        "forward_actions": [],
+        "policy_mode": "llm_contextual_choice",
+        "risk_can_override_goal": True,
     }
 
 

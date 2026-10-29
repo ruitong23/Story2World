@@ -431,11 +431,7 @@ def normalize_weak_relations(weak_db, canonical_entities):
         if (
             record["source_entity_type"] == "Character"
             and record["target_entity_type"] == "Character"
-            and (
-                relation["weak_relation_type"] in CHARACTER_RELATION_TYPES
-                or relation.get("evidence_kind")
-                in FINAL_CONTEXT_EVIDENCE_KINDS
-            )
+            and relation["weak_relation_type"] in CHARACTER_RELATION_TYPES
         ):
             record["final_relationship"] = True
     relationships = []
@@ -483,6 +479,7 @@ def normalize_weak_relations(weak_db, canonical_entities):
             "canonical_after_resolution": True,
             "weak_context_is_not_identity_merge": True,
             "same_scene_is_not_final_relationship": True,
+            "shared_context_is_not_final_relationship_without_explicit_relation": True,
             "agent_runtime_can_track_relationship_state": True,
         },
     }

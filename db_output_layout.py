@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import shutil
 from pathlib import Path
 
@@ -11,6 +12,7 @@ GRAPH_DB_DIR = GENERATED_DB_DIR / "graph"
 CANONICAL_DB_DIR = GENERATED_DB_DIR / "canonical"
 AGENT_DB_DIR = GENERATED_DB_DIR / "agents"
 RUNTIME_DB_DIR = GENERATED_DB_DIR / "runtime"
+GENERATED_DB_ARCHIVE_DIR = Path("db_runs")
 
 
 GRAPH_FILES = [
@@ -82,10 +84,32 @@ def ensure_generated_dirs(base_dir=Path(".")):
         (base_dir / directory).mkdir(parents=True, exist_ok=True)
 
 
+def archive_existing_generated_db(base_dir=Path(".")):
+    base_dir = Path(base_dir)
+    source_dir = base_dir / GENERATED_DB_DIR
+    if not source_dir.is_dir():
+        return None
+    if not any(source_dir.rglob("*.json")):
+        return None
+    archive_root = base_dir / GENERATED_DB_ARCHIVE_DIR
+    archive_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_dir = archive_root / f"db_{stamp}"
+    suffix = 1
+    while target_dir.exists():
+        suffix += 1
+        target_dir = archive_root / f"db_{stamp}_{suffix}"
+    shutil.copytree(source_dir, target_dir)
+    return str(target_dir)
+
+
 def publish_generated_databases(base_dir=Path(".")):
     base_dir = Path(base_dir)
+    archived = archive_existing_generated_db(base_dir)
     ensure_generated_dirs(base_dir)
     published = {}
+    if archived:
+        published["_archived_previous_db"] = archived
     for group, filenames in (
         ("graph", GRAPH_FILES),
         ("canonical", CANONICAL_FILES),
@@ -107,7 +131,7 @@ def cleanup_root_database_files(base_dir=Path("."), published=None):
     """Remove root-level generated JSON files after they were copied to db/."""
     base_dir = Path(base_dir)
     published = published or publish_generated_databases(base_dir)
-    protected = {"settings.json"}
+    protected = {"settings.json", "raw_graph_triples.json"}
     removed = []
     for filename in sorted(
         set(GRAPH_FILES + CANONICAL_FILES + AGENT_FILES + RUNTIME_FILES)

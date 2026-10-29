@@ -90,7 +90,7 @@ def default_llm_settings():
     return {
         "profile_name": "Local LM Studio",
         "llm_base_url": "http://localhost:1234/v1",
-        "llm_model": "gemma-4-26b-a4b-it",
+        "llm_model": "local-model",
         "llm_api_key": "lm-studio",
     }
 

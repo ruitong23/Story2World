@@ -44,6 +44,7 @@ def make_llm_callable(base_url, model, api_key):
             max_tokens=max_tokens,
             source="desktop_simulation",
             flow="step17_runtime",
+            thinking_enabled=False,
             response_format=response_format,
             timeout=900,
         )
@@ -202,7 +203,7 @@ class LLMProfileDialog(tk.Toplevel):
 class SimulationApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("NavelMaker 2 - Novel Simulation")
+        self.root.title("Story2World - 世界模拟")
         self.root.geometry("1280x820")
         self.root.minsize(1040, 700)
         self.events = queue.Queue()
@@ -256,10 +257,13 @@ class SimulationApp:
         self.eta_text = tk.StringVar(value="ETA: --")
         self.story_progress_value = tk.DoubleVar(value=0)
         self.story_progress_text = tk.StringVar(value="Story progress: --")
+        self.startup_guide_text = tk.StringVar(value="正在读取角色目录…")
+        self.agent_trace_expanded = True
 
         self._build_ui()
         self._refresh_agent_list()
         self._restore_active_character()
+        self._auto_select_initial_character()
         self._refresh_runtime_status()
         self._show_latest_story(prefer_recovery=True)
         self.root.after(100, self._drain_events)
@@ -297,32 +301,40 @@ class SimulationApp:
         header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         ttk.Label(
             header,
-            text="NavelMaker 2",
+            text="Story2World",
             font=("Segoe UI", 16, "bold"),
         ).pack(side="left")
         ttk.Label(header, textvariable=self.file_status_text, foreground="#137333").pack(
             side="right"
         )
 
-        left = ttk.LabelFrame(outer, text="Choose a character", padding=8)
+        left = ttk.LabelFrame(outer, text="选择进入角色", padding=8)
         left.grid(row=1, column=0, sticky="nsw", padx=(0, 8))
-        left.rowconfigure(1, weight=1)
+        left.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            left,
+            textvariable=self.startup_guide_text,
+            justify="left",
+            wraplength=280,
+            foreground="#365965",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 7))
 
         search = ttk.Entry(left, textvariable=self.search_text, width=32)
-        search.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        search.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         search.bind("<KeyRelease>", lambda _event: self._apply_filter())
 
         self.agent_list = tk.Listbox(left, width=35, exportselection=False)
         agent_scroll = ttk.Scrollbar(left, command=self.agent_list.yview)
         self.agent_list.configure(yscrollcommand=agent_scroll.set)
-        self.agent_list.grid(row=1, column=0, sticky="nsew")
-        agent_scroll.grid(row=1, column=1, sticky="ns")
+        self.agent_list.grid(row=2, column=0, sticky="nsew")
+        agent_scroll.grid(row=2, column=1, sticky="ns")
         self.agent_list.bind("<<ListboxSelect>>", self._select_agent)
 
         self.agent_detail = tk.Text(left, width=35, height=13, wrap="word", state="disabled")
-        self.agent_detail.grid(row=2, column=0, columnspan=2, pady=(8, 6), sticky="ew")
+        self.agent_detail.grid(row=3, column=0, columnspan=2, pady=(8, 6), sticky="ew")
         start_scope = ttk.Frame(left)
-        start_scope.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        start_scope.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         start_scope.columnconfigure(1, weight=1)
         ttk.Label(start_scope, text="Start %").grid(row=0, column=0, sticky="w")
         ttk.Scale(
@@ -333,9 +345,9 @@ class SimulationApp:
         ).grid(row=0, column=1, padx=6, sticky="ew")
         ttk.Label(start_scope, text="0 = auto").grid(row=0, column=2, sticky="e")
         self.enter_button = ttk.Button(
-            left, text="Enter world as this character", command=self.enter_world
+            left, text="生成开场并进入世界", command=self.enter_world
         )
-        self.enter_button.grid(row=4, column=0, columnspan=2, sticky="ew")
+        self.enter_button.grid(row=5, column=0, columnspan=2, sticky="ew")
 
         right = ttk.Frame(outer)
         right.grid(row=1, column=1, sticky="nsew")
@@ -411,21 +423,21 @@ class SimulationApp:
         self.story.configure(yscrollcommand=story_scroll.set)
         self.story.grid(row=0, column=0, sticky="nsew")
         story_scroll.grid(row=0, column=1, sticky="ns")
-        agent_trace_frame = ttk.LabelFrame(
+        self.agent_trace_frame = ttk.LabelFrame(
             story_tab,
-            text="Agent trace",
+            text="Agent thinking feedback",
             padding=6,
         )
-        agent_trace_frame.grid(
+        self.agent_trace_frame.grid(
             row=0,
             column=2,
             sticky="nsew",
             padx=(8, 0),
         )
-        agent_trace_frame.rowconfigure(0, weight=1)
-        agent_trace_frame.columnconfigure(0, weight=1)
+        self.agent_trace_frame.rowconfigure(0, weight=1)
+        self.agent_trace_frame.columnconfigure(0, weight=1)
         self.agent_trace = tk.Text(
-            agent_trace_frame,
+            self.agent_trace_frame,
             width=36,
             wrap="word",
             state="disabled",
@@ -434,7 +446,7 @@ class SimulationApp:
             pady=8,
         )
         agent_trace_scroll = ttk.Scrollbar(
-            agent_trace_frame,
+            self.agent_trace_frame,
             command=self.agent_trace.yview,
         )
         self.agent_trace.configure(yscrollcommand=agent_trace_scroll.set)
@@ -443,10 +455,19 @@ class SimulationApp:
 
         self.user_input = tk.Text(story_tab, height=4, wrap="word")
         self.user_input.grid(row=1, column=0, pady=(8, 0), sticky="ew")
+        story_actions = ttk.Frame(story_tab)
+        story_actions.grid(row=1, column=2, padx=(8, 0), pady=(8, 0), sticky="nsew")
+        story_actions.columnconfigure(0, weight=1)
         self.continue_button = ttk.Button(
-            story_tab, text="Continue story", command=self.continue_story
+            story_actions, text="Continue story", command=self.continue_story
         )
-        self.continue_button.grid(row=1, column=2, padx=(8, 0), pady=(8, 0), sticky="nsew")
+        self.continue_button.grid(row=0, column=0, sticky="ew")
+        self.agent_trace_toggle = ttk.Button(
+            story_actions,
+            text="Hide agent thinking",
+            command=self._toggle_agent_trace,
+        )
+        self.agent_trace_toggle.grid(row=1, column=0, pady=(8, 0), sticky="ew")
 
         world_tab.columnconfigure(0, weight=1)
         world_tab.rowconfigure(0, weight=1)
@@ -587,6 +608,49 @@ class SimulationApp:
         self.agent_list.see(index)
         self._select_agent()
 
+    def _auto_select_initial_character(self):
+        if self.selected_character_id:
+            return
+        if not self.list_ids:
+            self.startup_guide_text.set(
+                "这个 Project 没有可用角色，不能开始。请返回 Project 构建界面检查人物清单。"
+            )
+            self.enter_button.configure(state="disabled")
+            return
+        preferred_id = None
+        for character_id in self.list_ids:
+            character = self.character_by_id.get(character_id, {})
+            profile = self.orchestrator.agent_by_character_id.get(
+                character_id, {}
+            )
+            if (
+                character.get("playable")
+                or profile.get("playable")
+                or profile.get("profile_tier") == "full"
+            ):
+                preferred_id = character_id
+                break
+        preferred_id = preferred_id or self.list_ids[0]
+        index = self.list_ids.index(preferred_id)
+        self.agent_list.selection_clear(0, "end")
+        self.agent_list.selection_set(index)
+        self.agent_list.activate(index)
+        self.agent_list.see(index)
+        self._select_agent()
+        selected_name = self.character_by_id.get(preferred_id, {}).get(
+            "canonical_name", preferred_id
+        )
+        if len(self.list_ids) == 1:
+            self.startup_guide_text.set(
+                f"Project 中只有 1 名角色：{selected_name}。已自动选中。"
+                "如果前期明明选择过其他人物，请先不要生成开场，返回构建界面检查。"
+            )
+        else:
+            self.startup_guide_text.set(
+                f"已载入 {len(self.list_ids)} 名角色并自动选中玩家角色："
+                f"{selected_name}。可在下方改选；确认后点击“生成开场并进入世界”。"
+            )
+
     def _select_agent(self, _event=None):
         selection = self.agent_list.curselection()
         if not selection:
@@ -595,18 +659,30 @@ class SimulationApp:
         self.selected_character_id = character_id
         catalog = self.catalog_by_id[character_id]
         character = self.character_by_id.get(character_id, {})
+        is_player_entry = bool(
+            character.get("playable") or catalog.get("tier") == "full"
+        )
         detail = "\n".join(
             [
                 catalog.get("canonical_name", ""),
                 f"Tier: {catalog.get('tier', 'unknown')}",
+                f"控制方式: {'玩家可选' if is_player_entry else '自主 Agent'}",
+                f"角色身份: {character.get('attributes', {}).get('role', '')}",
                 catalog.get("notice", ""),
                 "",
                 character.get("background_summary", ""),
+                "",
+                "人格: " + "、".join(character.get("personality", [])[:8]),
+                "目标: " + "、".join(character.get("goals", [])[:6]),
                 "",
                 "Aliases: " + ", ".join(character.get("aliases", [])),
             ]
         ).strip()
         self._set_text(self.agent_detail, detail)
+        self.enter_button.configure(
+            text=f"生成开场并以 {catalog.get('canonical_name', '该角色')} 进入世界",
+            state="normal",
+        )
         self._show_character_status(character_id)
 
     def _show_character_status(self, character_id=None):
@@ -678,7 +754,7 @@ class SimulationApp:
             return
         text = self.user_input.get("1.0", "end").strip()
         if not text:
-            text = "观察并让局势自然推进"
+            text = "让局势按当前状态自然推进"
         self._run_operation(
             "Running the next simulation turn...",
             lambda: self.orchestrator.run_turn(
@@ -1472,14 +1548,179 @@ class SimulationApp:
             "active_other_agents": passive_present,
             "turn_contributors": contributors,
             "scene": scene,
+            "event": event,
             "event_id": event.get("event_id", "") if isinstance(event, dict) else "",
             "revision": event.get("revision_after", "") if isinstance(event, dict) else "",
             "pipeline": pipeline,
         }
 
+    def _short_trace_text(self, value, limit=180):
+        text = clean_text(value)
+        if len(text) > limit:
+            return text[: max(0, limit - 1)].rstrip() + "..."
+        return text
+
+    def _append_trace_detail(self, lines, label, value, limit=180):
+        text = self._short_trace_text(value, limit=limit)
+        if text:
+            lines.append(f"  {label}: {text}")
+
+    def _render_agent_thinking_feedback(self, trace):
+        pipeline = trace.get("pipeline") or {}
+        event = trace.get("event") or {}
+        lines = [
+            "Agent 思考反馈",
+            "以下是结构化决策摘要，不展示或保存模型原始隐藏推理。",
+        ]
+        added = False
+
+        player = pipeline.get("player_controller") or event.get("player_intent") or {}
+        if isinstance(player, dict) and player:
+            player_id = clean_text(player.get("character_id") or event.get("player_id"))
+            lines.append("")
+            lines.append(f"玩家角色 Agent：{self._character_name(player_id) if player_id else 'Player Controller'}")
+            self._append_trace_detail(
+                lines,
+                "念头消化",
+                player.get("thought_assimilation")
+                or player.get("private_reasoning_summary"),
+            )
+            self._append_trace_detail(
+                lines,
+                "下一意图",
+                player.get("resolved_intent") or player.get("action_type"),
+            )
+            self._append_trace_detail(lines, "情绪/状态", player.get("emotion"))
+            self._append_trace_detail(lines, "目标倾向", player.get("goal"))
+            added = True
+
+        npc_items = pipeline.get("nearby_npc_agents") or event.get("npc_agent_outputs") or []
+        if isinstance(npc_items, list) and npc_items:
+            lines.append("")
+            lines.append("NPC 角色 Agent")
+            for item in npc_items:
+                if not isinstance(item, dict):
+                    continue
+                name = (
+                    clean_text(item.get("canonical_name"))
+                    or self._character_name(clean_text(item.get("character_id")))
+                    or "未命名角色"
+                )
+                lines.append(f"- {name}")
+                action = item.get("action_intent", {})
+                if not isinstance(action, dict):
+                    action = {}
+                self._append_trace_detail(
+                    lines,
+                    "动机摘要",
+                    item.get("private_reasoning_summary"),
+                )
+                self._append_trace_detail(lines, "感知", item.get("perception"))
+                self._append_trace_detail(lines, "情绪", item.get("emotion"))
+                self._append_trace_detail(lines, "目标", item.get("goal"))
+                self._append_trace_detail(
+                    lines,
+                    "可见行为",
+                    item.get("visible_behavior") or action.get("description"),
+                )
+                self._append_trace_detail(lines, "台词", item.get("dialogue"))
+                added = True
+
+        sleeping = pipeline.get("sleeping_npc_agents") or []
+        if isinstance(sleeping, list) and sleeping:
+            lines.append("")
+            lines.append("本轮未唤醒的角色")
+            for item in sleeping[:8]:
+                if not isinstance(item, dict):
+                    continue
+                name = clean_text(item.get("canonical_name")) or self._character_name(
+                    clean_text(item.get("character_id"))
+                )
+                reason = self._short_trace_text(item.get("reason"), limit=120)
+                suffix = f": {reason}" if reason else ""
+                lines.append(f"- {name or '未命名角色'}{suffix}")
+            if len(sleeping) > 8:
+                lines.append(f"- 另有 {len(sleeping) - 8} 个角色本轮未唤醒")
+            added = True
+
+        group = pipeline.get("group_controller") or {}
+        if isinstance(group, dict) and (
+            pipeline.get("group_controller_ran") or group.get("ran")
+        ):
+            lines.append("")
+            lines.append("Group Controller")
+            self._append_trace_detail(lines, "策略", group.get("policy"))
+            self._append_trace_detail(lines, "原因", group.get("reason"))
+            groups = group.get("groups", [])
+            if isinstance(groups, list):
+                for item in groups[:4]:
+                    if isinstance(item, dict):
+                        self._append_trace_detail(
+                            lines,
+                            clean_text(item.get("label")) or "群体",
+                            item.get("summary") or item.get("visible_behavior"),
+                        )
+            added = True
+
+        local_world = pipeline.get("local_world_agent") or event.get("local_world") or {}
+        if isinstance(local_world, dict) and (
+            pipeline.get("local_world_agent_ran")
+            or local_world.get("world_changes")
+            or local_world.get("new_events")
+            or local_world.get("ambient_npc_reactions")
+            or local_world.get("scene_transition")
+        ):
+            lines.append("")
+            lines.append("Local World Agent")
+            changes = local_world.get("world_changes", [])
+            new_events = local_world.get("new_events", [])
+            ambient = local_world.get("ambient_npc_reactions", [])
+            lines.append(
+                f"  现场变化: {len(changes) if isinstance(changes, list) else 0} / "
+                f"新事件: {len(new_events) if isinstance(new_events, list) else 0} / "
+                f"环境反应: {len(ambient) if isinstance(ambient, list) else 0}"
+            )
+            transition = local_world.get("scene_transition", {})
+            if isinstance(transition, dict):
+                self._append_trace_detail(
+                    lines,
+                    "场景转移",
+                    transition.get("reason") or transition.get("location_id"),
+                )
+            added = True
+
+        gm = pipeline.get("gm_resolver") or event.get("gm_resolution") or {}
+        if isinstance(gm, dict) and gm:
+            lines.append("")
+            lines.append("GM Resolver")
+            self._append_trace_detail(lines, "结果", gm.get("outcome"))
+            self._append_trace_detail(lines, "影响等级", gm.get("impact_level"))
+            self._append_trace_detail(lines, "原著状态", gm.get("canonical_event_status"))
+            self._append_trace_detail(lines, "偏离原因", gm.get("divergence_reason"))
+            added = True
+
+        memory = pipeline.get("memory_agent") or {}
+        if isinstance(memory, dict) and memory:
+            lines.append("")
+            lines.append("Memory Agent")
+            recorded = "yes" if memory.get("event_memory_recorded") else "no"
+            compacted = "yes" if memory.get("summary_compaction_ran") else "no"
+            visible_count = memory.get("visible_actor_count", 0)
+            lines.append(
+                f"  事件写入: {recorded} / 当日整理: {compacted} / 可见角色: {visible_count}"
+            )
+            added = True
+
+        if not added:
+            lines.append("")
+            lines.append("- 等待下一轮运行后显示 agent 反馈")
+        return lines
+
     def _render_agent_trace(self, trace):
         scene = trace.get("scene", {})
-        lines = []
+        lines = self._render_agent_thinking_feedback(trace)
+        lines.append("")
+        lines.append("运行轨迹")
         lines.append("当前局部场景")
         lines.append(f"地点：{scene.get('location_name') or scene.get('location_id') or '未定位'}")
         lines.append(f"事件：{trace.get('event_id') or '暂无'}")
@@ -1523,6 +1764,23 @@ class SimulationApp:
         else:
             lines.append("- 等待下一轮运行")
         return "\n".join(lines)
+
+    def _toggle_agent_trace(self):
+        if not hasattr(self, "agent_trace_frame"):
+            return
+        self.agent_trace_expanded = not self.agent_trace_expanded
+        if self.agent_trace_expanded:
+            self.agent_trace_frame.grid(
+                row=0,
+                column=2,
+                sticky="nsew",
+                padx=(8, 0),
+            )
+            self.agent_trace_toggle.configure(text="Hide agent thinking")
+            self._refresh_agent_trace()
+        else:
+            self.agent_trace_frame.grid_remove()
+            self.agent_trace_toggle.configure(text="Show agent thinking")
 
     def _refresh_agent_trace(self, event=None):
         if not hasattr(self, "agent_trace"):
@@ -1710,6 +1968,8 @@ class SimulationApp:
                     self._refresh_runtime_status()
                     self._refresh_agent_trace(payload)
                     pipeline = payload.get("pipeline", payload)
+                    if pipeline.get("background_knowledge_status"):
+                        self.progress_text.set("本轮完成 · " + pipeline["background_knowledge_status"])
                     self._set_text(
                         self.diagnostics,
                         json.dumps(pipeline, ensure_ascii=False, indent=2),
@@ -1786,7 +2046,7 @@ def main():
         lines = "\n".join(f"- {item['name']}: {item['description']}" for item in missing)
         messagebox.showerror(
             "Simulation files missing",
-            "Run 02_prepare_simulation.bat first.\n\nMissing files:\n" + lines,
+            "Run 02_novel_world_builder.bat first.\n\nMissing files:\n" + lines,
             parent=root,
         )
         root.destroy()

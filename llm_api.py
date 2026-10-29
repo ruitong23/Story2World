@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -27,6 +28,70 @@ def _error_detail(error: urllib.error.HTTPError) -> str:
         return str(inner)
     except json.JSONDecodeError:
         return detail.strip() or str(error)
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().casefold()
+    if text in {"1", "true", "yes", "y", "on", "enabled", "enable"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disabled", "disable"}:
+        return False
+    return default
+
+
+def strip_thinking_blocks(text: str) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    for tag in ("think", "thinking", "reasoning"):
+        lower = text.casefold()
+        open_tag = f"<{tag}>"
+        close_tag = f"</{tag}>"
+        while open_tag in lower:
+            start = lower.find(open_tag)
+            end = lower.find(close_tag, start + len(open_tag))
+            if end < 0:
+                json_positions = [
+                    pos
+                    for pos in (
+                        text.find("{", start + len(open_tag)),
+                        text.find("[", start + len(open_tag)),
+                    )
+                    if pos >= 0
+                ]
+                if json_positions:
+                    text = text[min(json_positions):].strip()
+                else:
+                    text = text[:start].strip()
+                break
+            text = (text[:start] + text[end + len(close_tag):]).strip()
+            lower = text.casefold()
+    return text.strip()
+
+
+def with_thinking_instruction(messages: list[dict[str, str]], thinking_enabled: bool) -> list[dict[str, str]]:
+    if thinking_enabled:
+        instruction = (
+            "If you use internal reasoning, do not include it in the answer. "
+            "Never output <think>, reasoning_content, analysis, or chain-of-thought. "
+            "Return only the requested final content."
+        )
+    else:
+        instruction = (
+            "Thinking/reasoning mode is disabled for this request. Do not think out loud. "
+            "Do not output <think>, reasoning_content, analysis, hidden reasoning, or chain-of-thought. "
+            "Return only the requested final answer."
+        )
+    result = [dict(item) for item in messages]
+    if result and result[0].get("role") == "system":
+        result[0]["content"] = instruction + "\n\n" + str(result[0].get("content", ""))
+    else:
+        result.insert(0, {"role": "system", "content": instruction})
+    return result
 
 
 def request_json(url: str, api_key: str, timeout: int = 30) -> dict[str, Any]:
@@ -66,6 +131,7 @@ def log_token_usage(
     prompt_text: str = "",
     completion_text: str = "",
     estimated: bool = False,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     usage = usage or {}
     prompt_tokens = usage.get("prompt_tokens")
@@ -90,6 +156,8 @@ def log_token_usage(
         "total_tokens": int(total_tokens or 0),
         "estimated": bool(estimated),
     }
+    if extra:
+        record.update(extra)
     TOKEN_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with TOKEN_USAGE_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -145,9 +213,35 @@ def chat_completion(
     source: str,
     flow: str,
     response_format: dict[str, Any] | None = None,
+    thinking_enabled: bool = False,
     timeout: int = 600,
 ) -> str:
-    def build_payload(next_response_format):
+    thinking_enabled = parse_bool(thinking_enabled, default=False)
+    messages = with_thinking_instruction(messages, thinking_enabled)
+
+    def thinking_control_variants():
+        if thinking_enabled:
+            return [{}]
+        return [
+            {
+                "reasoning_effort": "none",
+                "enable_thinking": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "thinking": {"type": "disabled"},
+                "reasoning": {"effort": "none"},
+            },
+            {
+                "enable_thinking": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            {
+                "reasoning_effort": "none",
+                "thinking": {"type": "disabled"},
+            },
+            {},
+        ]
+
+    def build_payload(next_response_format, thinking_controls):
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -155,6 +249,7 @@ def chat_completion(
             "max_tokens": max_tokens,
             "stream": False,
         }
+        payload.update(thinking_controls)
         if next_response_format:
             payload["response_format"] = next_response_format
         return payload
@@ -168,30 +263,44 @@ def chat_completion(
     prompt_text = "\n".join(item.get("content", "") for item in messages)
     last_error = None
     body = None
+    selected_response_format = None
+    selected_thinking_controls: dict[str, Any] = {}
+    request_started = time.perf_counter()
     for next_response_format in response_formats:
-        payload = build_payload(next_response_format)
-        request = urllib.request.Request(
-            base_url.rstrip("/") + "/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
+        for thinking_controls in thinking_control_variants():
+            payload = build_payload(next_response_format, thinking_controls)
+            request = urllib.request.Request(
+                base_url.rstrip("/") + "/chat/completions",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                selected_response_format = next_response_format
+                selected_thinking_controls = dict(thinking_controls)
+                break
+            except urllib.error.HTTPError as error:
+                last_error = RuntimeError(f"HTTP {error.code}: {_error_detail(error)}")
+                if error.code in {400, 422} and (
+                    thinking_controls or next_response_format
+                ):
+                    continue
+                raise last_error from error
+        if body is not None:
             break
-        except urllib.error.HTTPError as error:
-            last_error = RuntimeError(f"HTTP {error.code}: {_error_detail(error)}")
-            if error.code in {400, 422} and next_response_format:
-                continue
-            raise last_error from error
     if body is None:
         raise last_error or RuntimeError("LLM request failed.")
 
-    content = body["choices"][0]["message"]["content"].strip()
+    message = body["choices"][0].get("message", {})
+    raw_content = message.get("content") or ""
+    content = strip_thinking_blocks(raw_content).strip()
+    elapsed_seconds = round(time.perf_counter() - request_started, 3)
+    raw_casefold = str(raw_content).casefold()
     log_token_usage(
         source=source,
         flow=flow,
@@ -200,5 +309,26 @@ def chat_completion(
         usage=body.get("usage"),
         prompt_text=prompt_text,
         completion_text=content,
+        extra={
+            "elapsed_seconds": elapsed_seconds,
+            "thinking_enabled": bool(thinking_enabled),
+            "thinking_controls_sent": sorted(selected_thinking_controls.keys()),
+            "response_format_sent": (
+                selected_response_format.get("type")
+                if isinstance(selected_response_format, dict)
+                else ""
+            ),
+            "raw_completion_chars": len(str(raw_content)),
+            "stripped_completion_chars": len(content),
+            "thinking_markup_detected": any(
+                marker in raw_casefold
+                for marker in (
+                    "<think",
+                    "<thinking",
+                    "<reasoning",
+                    "reasoning_content",
+                )
+            ),
+        },
     )
     return content
