@@ -1246,7 +1246,7 @@ novel_ontology = {
 
         entity_type(
             "TitleOrIdentity",
-            "角色的别名、称号、身份、临时身份、变化身份或被他人称呼的名号。",
+            "角色的别名、称号、身份、临时身份、外在身份呈现或被他人称呼的名号。",
             ["Step 9", "Step 10", "Step 11", "Step 14", "Step 16"],
             [
                 field("identity_subtype", "string", "身份类型，例如 alias, title, role, temporary_identity, transformation_form。", False, ["Step 10", "Step 11", "Step 14"])
@@ -1255,7 +1255,7 @@ novel_ontology = {
 
         entity_type(
             "WorldRule",
-            "世界运行规则、能力限制、因果规则、身份约束、行动约束或修行体系规则。",
+            "世界运行规则、能力限制、因果规则、身份约束、行动约束或成长体系规则。",
             ["Step 9", "Step 13", "Step 15", "Step 17"],
             [
                 field("rule_subtype", "string", "规则类型，例如 ability_limit, institutional_rule, social_rule, causal_rule。", False, ["Step 15", "Step 17"]),
@@ -1298,13 +1298,13 @@ novel_ontology = {
         edge_type("HAS_ALIAS", "角色或实体具有某个别名。", ["Character"], ["TitleOrIdentity", "Character"], ["Step 9", "Step 10", "Step 11"]),
         edge_type("HAS_TITLE", "角色当前或持续具有某个称号、官职、身份名号。", ["Character"], ["TitleOrIdentity"], ["Step 9", "Step 10", "Step 11", "Step 14"]),
         edge_type("HAS_FORMER_IDENTITY", "角色过去曾具有、如今已不再作为当前身份使用的身份、职位或形态。", ["Character"], ["TitleOrIdentity"], ["Step 9", "Step 10", "Step 11", "Step 12", "Step 14"]),
-        edge_type("TRANSFORMS_INTO", "角色变化、伪装或显出某种身份/形态。", ["Character"], ["TitleOrIdentity", "Character"], ["Step 9", "Step 10", "Step 11", "Step 14"]),
+        edge_type("TRANSFORMS_INTO", "角色呈现、转换或显出某种身份/形态。", ["Character"], ["TitleOrIdentity", "Character"], ["Step 9", "Step 10", "Step 11", "Step 14"]),
         edge_type("HAS_RELATIONSHIP", "角色与角色之间存在明确关系。", ["Character"], ["Character"], ["Step 9", "Step 10", "Step 11", "Step 14", "Step 16"]),
         edge_type("SEEKS_HELP_FROM", "角色主动向另一角色或组织寻求帮助、指引或解决办法。", ["Character"], ["Character", "Organization"], ["Step 9", "Step 13", "Step 14", "Step 16"]),
         edge_type("VISITS", "角色明确拜访、到访另一角色、组织或地点。", ["Character"], ["Character", "Organization", "Location"], ["Step 9", "Step 13", "Step 14"]),
         edge_type("USES_ABILITY", "角色在文本中使用某种能力。", ["Character"], ["Ability"], ["Step 9", "Step 10", "Step 11", "Step 14", "Step 16"]),
         edge_type("OWNS_ARTIFACT", "角色拥有、携带或被明确归属某物品。", ["Character"], ["Artifact"], ["Step 9", "Step 10", "Step 11", "Step 14", "Step 16"]),
-        edge_type("USES_ARTIFACT", "角色使用某物品、兵器、法宝或坐骑。", ["Character"], ["Artifact"], ["Step 9", "Step 10", "Step 11", "Step 14", "Step 16"]),
+        edge_type("USES_ARTIFACT", "角色使用某物品、装备、工具或载具。", ["Character"], ["Artifact"], ["Step 9", "Step 10", "Step 11", "Step 14", "Step 16"]),
         edge_type("PARTICIPATES_IN", "角色、组织或物品参与某事件。", ["Character", "Organization", "Artifact"], ["Event"], ["Step 9", "Step 10", "Step 11", "Step 13", "Step 14"]),
         edge_type("EVENT_OCCURS_AT", "事件发生在某地点。", ["Event"], ["Location"], ["Step 9", "Step 13", "Step 15", "Step 17"]),
         edge_type("BELONGS_TO", "角色、组织、地点、物品或身份归属于某组织、机构、势力或阵营。", ["Character", "Organization", "Location", "Artifact", "TitleOrIdentity"], ["Organization"], ["Step 9", "Step 13", "Step 15"]),
@@ -1322,8 +1322,8 @@ novel_ontology = {
         edge_type("SCOPE_COVERS", "知识范围具体涉及某个实体、事件、规则或能力。", ["KnowledgeScope"], ["Character", "Location", "Organization", "Artifact", "Ability", "Event", "WorldRule"], ["Step 9", "Step 13", "Step 15", "Step 16", "Step 17"]),
         edge_type("HAS_SPEECH_STYLE", "角色具有某种说话风格。", ["Character"], ["SpeechStyle"], ["Step 9", "Step 14", "Step 16"]),
         edge_type("HAS_CONFLICT_WITH", "角色或组织存在持续冲突或敌对。", ["Character", "Organization"], ["Character", "Organization"], ["Step 9", "Step 13", "Step 14", "Step 17"]),
-        edge_type("REVEALED_AS", "临时外表、称呼或伪装被明确揭示为真实身份。", ["Character", "TitleOrIdentity"], ["Character"], ["Step 9", "Step 10", "Step 11", "Step 14"]),
-        edge_type("IMPERSONATES", "角色变化、伪装或模仿成另一身份/外貌，不代表同一真实实体。", ["Character"], ["Character", "TitleOrIdentity"], ["Step 9", "Step 13", "Step 14"]),
+        edge_type("REVEALED_AS", "临时外表、称呼或外在身份被明确揭示为真实身份。", ["Character", "TitleOrIdentity"], ["Character"], ["Step 9", "Step 10", "Step 11", "Step 14"]),
+        edge_type("IMPERSONATES", "角色呈现或模仿成另一身份/外貌，不代表同一真实实体。", ["Character"], ["Character", "TitleOrIdentity"], ["Step 9", "Step 13", "Step 14"]),
         edge_type("MASTER_OF", "角色是另一角色的教师、导师或正式指导者。", ["Character"], ["Character"], ["Step 9", "Step 13", "Step 14"]),
         edge_type("DISCIPLE_OF", "角色是另一角色的学生、学徒或受指导者。", ["Character"], ["Character"], ["Step 9", "Step 13", "Step 14"]),
         edge_type("FIGHTS_WITH", "角色或组织与另一方发生明确战斗。", ["Character", "Organization"], ["Character", "Organization"], ["Step 9", "Step 13", "Step 14"]),
@@ -1351,7 +1351,7 @@ novel_ontology = {
     },
 
     "entity_resolution_guidance": {
-        "description": "Step 11 不能只靠名字相似度；必须使用别名、称号、变化身份、关系、共同事件、地点、能力、物品等图上下文。",
+        "description": "Step 11 不能只靠名字相似度；必须使用别名、称号、外在身份呈现、关系、共同事件、地点、能力、物品等图上下文。",
         "useful_node_types": ["Character", "TitleOrIdentity", "Ability", "Artifact", "Event", "Location"],
         "useful_edge_types": [
             "HAS_ALIAS",
@@ -5719,7 +5719,7 @@ def build_identity_layers(character):
         roleplay_identities.append({
             "identity": name,
             "is_true_self": False,
-            "purpose": "临时身份、形态或伪装；用于行动策略，不等同本体",
+            "purpose": "临时身份、形态或外在呈现；用于行动策略，不等同本体",
             "source": "identity_or_form_evidence",
         })
     subtypes = character.get("attributes", {}).get("entity_subtype", [])
@@ -5744,7 +5744,7 @@ def build_identity_layers(character):
         ),
         "roleplay_identities": roleplay_identities,
         "policy": (
-            "模拟时本体、根本欲望与长期目标优先；伪装、化身、称号、"
+            "模拟时本体、根本欲望与长期目标优先；外在身份、称号、"
             "临时职业或日常外壳只能作为达成目的的策略。"
         ),
     }
@@ -5758,39 +5758,21 @@ def build_motivation_action_policy(
     temptations,
     trigger_rules,
 ):
-    text = "；".join(
-        clean_graph_text(item)
-        for item in [
-            *root_drives,
-            *current_objectives,
-            *fears,
-            *strategy_patterns,
-            *temptations,
-            *trigger_rules,
-        ]
-        if clean_graph_text(item)
-    )
-    pursues_tang = "唐僧" in text or "唐僧肉" in text
-    has_high_threat = any(
-        word in text
-        for word in ("孙悟空", "悟空", "火眼金睛", "识破", "暴露", "降伏", "诛杀")
-    )
-    uses_disguise = any(
-        word in text
-        for word in ("伪装", "变身", "化身", "临时身份", "骗", "诱")
-    )
+    pursues_target = bool(root_drives or current_objectives or temptations)
+    has_high_threat = bool(fears)
+    uses_strategy = bool(strategy_patterns or trigger_rules)
     forward_actions = ["观察", "试探", "换策略", "保留下一步机会"]
-    if uses_disguise:
-        forward_actions.extend(["维护伪装", "变换身份", "制造误判"])
-    if pursues_tang:
-        forward_actions.extend(["接近唐僧", "诱导唐僧", "分散护卫注意"])
+    if uses_strategy:
+        forward_actions.extend(["维护当前策略", "调整身份呈现", "制造误判"])
+    if pursues_target:
+        forward_actions.extend(["推进当前目标", "试探相关对象", "分散阻碍注意"])
     if has_high_threat:
-        forward_actions.extend(["绕开孙悟空视线", "拉开风险距离", "等待护卫破绽"])
+        forward_actions.extend(["绕开威胁视线", "拉开风险距离", "等待防线破绽"])
     return {
-        "priority": "根本欲望决定方向；恐惧只改变路线、节奏和伪装强度。",
+        "priority": "根本欲望决定方向；恐惧只改变路线、节奏和策略强度。",
         "when_threatened": (
-            "高威胁下先隐蔽推进核心目标：维护伪装、换身份、转移视线、"
-            "分散威胁、试探目标或制造机会；暂避必须同时保留下一步机会。"
+            "高威胁下先隐蔽推进核心目标：维护当前策略、调整身份呈现、转移视线、"
+            "分散威胁、试探相关对象或制造机会；暂避必须同时保留下一步机会。"
         ),
         "stall_guard": (
             "除非玩家明确要求或角色被外力限制，不要整轮只屏息、僵住、"
@@ -5798,7 +5780,7 @@ def build_motivation_action_policy(
         ),
         "action_bias": (
             "risk_managed_pursuit"
-            if pursues_tang and has_high_threat
+            if pursues_target and has_high_threat
             else "goal_directed_survival"
         ),
         "forward_actions": step14_clean_list(forward_actions, 12),
@@ -5808,7 +5790,6 @@ def build_motivation_action_policy(
 
 def build_core_motivation(character):
     basis = step14_character_basis_texts(character)
-    basis_text = "；".join(basis)
     canonical_name = character.get("canonical_name", "")
     identity_layers = character.get("identity_layers") or build_identity_layers(
         character
@@ -5824,28 +5805,13 @@ def build_core_motivation(character):
     emotional_baseline = step14_clean_list(character.get("personality", []), 8)
     inference_notes = []
 
-    if "唐僧肉" in basis_text:
-        temptations.append("唐僧肉")
-        trigger_rules.append("看见或确认唐僧会触发接近、诱骗、捕获或下手判断")
-        if "骗" in basis_text or "变身" in basis_text:
-            current_objectives.append("通过变身或伪装接近唐僧并骗取唐僧肉")
-            strategy_patterns.extend(["伪装弱者或普通人", "利用目标的慈悲与戒心漏洞"])
-        else:
-            current_objectives.append("围绕唐僧肉寻找机会")
-        root_drives.append("获取唐僧肉带来的生存、修为或长生利益")
-        emotional_baseline.extend(["贪求", "戒备"])
-        inference_notes.append("唐僧肉常作为长生与修为利益目标；此处由行动对象保守推断")
-    if "变身" in basis_text or identity_layers.get("roleplay_identities"):
-        strategy_patterns.append("使用伪装、变身或临时身份接近目标")
-        trigger_rules.append("身份可能暴露时维护伪装、换策略或暂避，但仍服务核心目标")
-    if "火眼金睛" in basis_text or "识破妖怪" in basis_text:
-        fears.append("孙悟空的火眼金睛或识破能力")
-        trigger_rules.append("孙悟空靠近或审视时触发暴露风险判断")
-    if "紧箍咒" in basis_text and ("孙悟空" in basis_text or "悟空" in basis_text):
-        trigger_rules.append("唐僧牵制孙悟空时会改变风险与机会判断")
-    if "妖怪" in basis_text or canonical_name.endswith("精"):
-        root_drives.append("保全妖怪本体并延续修行")
-        fears.append("本体暴露后遭到降伏或诛杀")
+    if current_objectives:
+        inference_notes.append("角色目标来自抽取出的 goals 字段；代码不按作品词表额外推断目标")
+    if identity_layers.get("roleplay_identities"):
+        strategy_patterns.append("不同身份或外在呈现是行动策略，不是本体人格")
+        trigger_rules.append("身份策略受压时调整呈现方式，但仍服务核心目标")
+    if fears:
+        inference_notes.append("角色风险来自抽取出的 constraints 字段；代码不按作品词表额外推断风险")
     for relation in character.get("all_relations", []):
         relation_type = relation.get("relation_type", "")
         name = relation.get("name", "")
@@ -8489,7 +8455,7 @@ def step16_prompt_text(profile, project_language):
             lines.append("已确认身份称谓：" + "、".join(names))
         if profile["identity"]["forms"]:
             lines.append(
-                "形态或伪装（不是稳定别名）："
+                "外在形态或身份呈现（不是稳定别名）："
                 + "、".join(profile["identity"]["forms"])
             )
         summary = profile["state"]["background_summary"]
@@ -8527,7 +8493,7 @@ def step16_prompt_text(profile, project_language):
                 )
             lines.append(
                 "行动原则：先由本体、欲望、恐惧、牵挂与当前目的决定行动；"
-                "临时身份、伪装和日常外壳只能作为策略。"
+                "临时身份、外在呈现和日常外壳只能作为策略。"
             )
         if profile["relationships"]:
             lines.append(

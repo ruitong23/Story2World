@@ -20,7 +20,7 @@ from app_files import (
     set_active_llm_profile,
     delete_llm_profile,
 )
-from step17_runtime import load_step17_runtime
+from step17_runtime import clean_text, load_step17_runtime
 from llm_api import chat_completion, list_models, token_usage_summary
 
 
@@ -1084,7 +1084,7 @@ class SimulationApp:
         if not gaps.get("has_prebuilt_agent_profile"):
             gap_lines.append("没有预制角色画像，需要运行时用原文片段补充性格、口吻和行动习惯")
         if not gaps.get("has_direct_relationship_lines"):
-            gap_lines.append("没有直接关系线，需要从附近事件推断与唐僧师徒的冲突关系")
+            gap_lines.append("没有直接关系线，需要从附近事件推断与关键人物或组织的冲突关系")
         if not gaps.get("has_raw_chunk_context"):
             gap_lines.append("没有原始片段上下文，需要回查原文")
         if not gap_lines:
@@ -1354,8 +1354,6 @@ class SimulationApp:
                 else 0
             )
             status_parts = []
-            if isinstance(local_world, dict) and local_world.get("forced_progress"):
-                status_parts.append("forced reveal")
             if ambient_count:
                 status_parts.append(f"ambient NPC x{ambient_count}")
             if event_count:
@@ -1443,8 +1441,6 @@ class SimulationApp:
                 ambient_count = len(local_world.get("ambient_npc_reactions", []))
                 event_count = len(local_world.get("new_events", []))
                 status_parts = []
-                if local_world.get("forced_progress"):
-                    status_parts.append("forced reveal")
                 if ambient_count:
                     status_parts.append(f"ambient NPC x{ambient_count}")
                 if event_count:
