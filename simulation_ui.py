@@ -25,7 +25,13 @@ from llm_api import chat_completion, list_models, token_usage_summary
 
 
 def make_llm_callable(base_url, model, api_key):
-    def call_llm(system_prompt, user_prompt, temperature=0.2, max_tokens=4096):
+    def call_llm(
+        system_prompt,
+        user_prompt,
+        temperature=0.2,
+        max_tokens=4096,
+        response_format=None,
+    ):
         return chat_completion(
             base_url=base_url,
             api_key=api_key,
@@ -38,6 +44,7 @@ def make_llm_callable(base_url, model, api_key):
             max_tokens=max_tokens,
             source="desktop_simulation",
             flow="step17_runtime",
+            response_format=response_format,
             timeout=900,
         )
 
@@ -196,8 +203,8 @@ class SimulationApp:
     def __init__(self, root):
         self.root = root
         self.root.title("NavelMaker 2 - Novel Simulation")
-        self.root.geometry("1180x800")
-        self.root.minsize(960, 680)
+        self.root.geometry("1280x820")
+        self.root.minsize(1040, 700)
         self.events = queue.Queue()
         self.operation_started = None
         self.selected_character_id = None
@@ -381,13 +388,16 @@ class SimulationApp:
         notebook = ttk.Notebook(right)
         notebook.grid(row=1, column=0, pady=(8, 0), sticky="nsew")
         story_tab = ttk.Frame(notebook, padding=8)
+        world_tab = ttk.Frame(notebook, padding=8)
         status_tab = ttk.Frame(notebook, padding=8)
         diagnostics_tab = ttk.Frame(notebook, padding=8)
         notebook.add(story_tab, text="Story")
+        notebook.add(world_tab, text="World admin")
         notebook.add(status_tab, text="Character status")
         notebook.add(diagnostics_tab, text="Diagnostics")
 
         story_tab.columnconfigure(0, weight=1)
+        story_tab.columnconfigure(2, weight=0)
         story_tab.rowconfigure(0, weight=1)
         self.story = tk.Text(
             story_tab,
@@ -401,13 +411,72 @@ class SimulationApp:
         self.story.configure(yscrollcommand=story_scroll.set)
         self.story.grid(row=0, column=0, sticky="nsew")
         story_scroll.grid(row=0, column=1, sticky="ns")
+        agent_trace_frame = ttk.LabelFrame(
+            story_tab,
+            text="Agent trace",
+            padding=6,
+        )
+        agent_trace_frame.grid(
+            row=0,
+            column=2,
+            sticky="nsew",
+            padx=(8, 0),
+        )
+        agent_trace_frame.rowconfigure(0, weight=1)
+        agent_trace_frame.columnconfigure(0, weight=1)
+        self.agent_trace = tk.Text(
+            agent_trace_frame,
+            width=36,
+            wrap="word",
+            state="disabled",
+            font=("Microsoft YaHei UI", 9),
+            padx=8,
+            pady=8,
+        )
+        agent_trace_scroll = ttk.Scrollbar(
+            agent_trace_frame,
+            command=self.agent_trace.yview,
+        )
+        self.agent_trace.configure(yscrollcommand=agent_trace_scroll.set)
+        self.agent_trace.grid(row=0, column=0, sticky="nsew")
+        agent_trace_scroll.grid(row=0, column=1, sticky="ns")
 
         self.user_input = tk.Text(story_tab, height=4, wrap="word")
         self.user_input.grid(row=1, column=0, pady=(8, 0), sticky="ew")
         self.continue_button = ttk.Button(
             story_tab, text="Continue story", command=self.continue_story
         )
-        self.continue_button.grid(row=1, column=1, padx=(8, 0), pady=(8, 0), sticky="ns")
+        self.continue_button.grid(row=1, column=2, padx=(8, 0), pady=(8, 0), sticky="nsew")
+
+        world_tab.columnconfigure(0, weight=1)
+        world_tab.rowconfigure(0, weight=1)
+        self.world_admin_output = tk.Text(
+            world_tab,
+            wrap="word",
+            state="disabled",
+            font=("Microsoft YaHei UI", 10),
+            padx=10,
+            pady=10,
+        )
+        world_scroll = ttk.Scrollbar(world_tab, command=self.world_admin_output.yview)
+        self.world_admin_output.configure(yscrollcommand=world_scroll.set)
+        self.world_admin_output.grid(row=0, column=0, sticky="nsew")
+        world_scroll.grid(row=0, column=1, sticky="ns")
+        self.world_admin_input = tk.Text(world_tab, height=4, wrap="word")
+        self.world_admin_input.grid(row=1, column=0, pady=(8, 0), sticky="ew")
+        world_actions = ttk.Frame(world_tab)
+        world_actions.grid(row=1, column=1, padx=(8, 0), pady=(8, 0), sticky="ns")
+        self.world_admin_send_button = ttk.Button(
+            world_actions,
+            text="Ask / Apply",
+            command=self.send_world_admin,
+        )
+        self.world_admin_send_button.pack(fill="x")
+        ttk.Button(
+            world_actions,
+            text="Refresh",
+            command=self.refresh_world_admin_snapshot,
+        ).pack(fill="x", pady=(6, 0))
 
         self.status_view = tk.Text(status_tab, wrap="word", state="disabled")
         self.status_view.pack(fill="both", expand=True)
@@ -463,6 +532,49 @@ class SimulationApp:
         lines.append("")
         lines.append(f"Log file: {usage.get('path')}")
         messagebox.showinfo("Token usage", "\n".join(lines), parent=self.root)
+
+    def _append_world_admin(self, speaker, text):
+        self.world_admin_output.configure(state="normal")
+        current = self.world_admin_output.get("1.0", "end").strip()
+        prefix = "\n\n" if current else ""
+        self.world_admin_output.insert(
+            "end",
+            f"{prefix}{speaker}\n{text.strip()}",
+        )
+        self.world_admin_output.see("end")
+        self.world_admin_output.configure(state="disabled")
+
+    def refresh_world_admin_snapshot(self):
+        snapshot = self.orchestrator.world_admin_snapshot()
+        self._set_text(
+            self.world_admin_output,
+            json.dumps(snapshot, ensure_ascii=False, indent=2),
+        )
+
+    def send_world_admin(self):
+        text = self.world_admin_input.get("1.0", "end").strip()
+        if not text:
+            messagebox.showwarning(
+                "World admin",
+                "Enter a world/admin question or modification request first.",
+                parent=self.root,
+            )
+            return
+        self.world_admin_input.delete("1.0", "end")
+        self._append_world_admin("You", text)
+        self.progress_value.set(8)
+        self.progress_text.set("World admin is reading runtime state...")
+        self.eta_text.set("ETA: calculating")
+        self.world_admin_send_button.configure(state="disabled")
+
+        def worker():
+            try:
+                result = self.orchestrator.world_admin_chat(text)
+                self.events.put(("world_admin_done", result))
+            except Exception as error:
+                self.events.put(("world_admin_error", error))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _restore_active_character(self):
         scene = self.store.runtime.get("active_scene") or {}
@@ -530,6 +642,7 @@ class SimulationApp:
         self.enter_button.configure(state="disabled")
         self.continue_button.configure(state="disabled")
         self.save_button.configure(state="disabled")
+        self.world_admin_send_button.configure(state="disabled")
 
         def worker():
             try:
@@ -565,7 +678,7 @@ class SimulationApp:
             return
         text = self.user_input.get("1.0", "end").strip()
         if not text:
-            text = "I pause and pay attention to what is happening around me."
+            text = "观察并让局势自然推进"
         self._run_operation(
             "Running the next simulation turn...",
             lambda: self.orchestrator.run_turn(
@@ -1074,6 +1187,353 @@ class SimulationApp:
             in {"scene_opening_rendered", "immersive_scene_turn"}
         ]
 
+    def _latest_story_event(self):
+        events = self._story_events()
+        return events[-1] if events else {}
+
+    def _character_name(self, character_id):
+        try:
+            profile = self.orchestrator._dynamic_profile(character_id)
+            if profile.get("canonical_name"):
+                return profile["canonical_name"]
+        except Exception:
+            pass
+        return (
+            self.character_by_id.get(character_id, {}).get("canonical_name")
+            or self.catalog_by_id.get(character_id, {}).get("canonical_name")
+            or character_id
+        )
+
+    def _agent_trace_snapshot(self, event=None):
+        result = event if isinstance(event, dict) and "event" in event else {}
+        event = (
+            result.get("event")
+            if result
+            else event or self._latest_story_event()
+        )
+        if not isinstance(event, dict):
+            event = {}
+        scene = self.store.runtime.get("active_scene") or {}
+        participant_ids = [
+            item for item in scene.get("participant_ids", []) if item
+        ]
+        focus_id = scene.get("focus_character_id")
+        pipeline = result.get("pipeline", {}) if result else event.get("pipeline", {})
+        if not pipeline:
+            pipeline = event.get("backend_pipeline", {})
+        active_agent_ids = {
+            clean_text(item.get("character_id"))
+            for item in pipeline.get("nearby_npc_agents", [])
+            if isinstance(item, dict) and clean_text(item.get("character_id"))
+        }
+        if not active_agent_ids and isinstance(event, dict):
+            active_agent_ids = {
+                clean_text(item.get("character_id"))
+                for item in event.get("npc_agent_outputs", [])
+                if isinstance(item, dict) and clean_text(item.get("character_id"))
+            }
+        agent_controlled = []
+        passive_present = []
+        for character_id in participant_ids:
+            catalog = self.catalog_by_id.get(character_id, {})
+            try:
+                profile = self.orchestrator._dynamic_profile(character_id)
+            except Exception:
+                profile = {}
+            tier = catalog.get("tier") or profile.get("profile_tier", "reference")
+            runtime_mode = (
+                catalog.get("runtime_mode")
+                or profile.get("runtime_mode")
+                or ""
+            )
+            control = (
+                "MANUAL"
+                if character_id == focus_id
+                else self.store.runtime.get("agent_control", {}).get(
+                    character_id,
+                    "AUTO",
+                )
+            )
+            is_agent_controlled = bool(
+                character_id == focus_id
+                or character_id in active_agent_ids
+                or (
+                    control == "AUTO"
+                    and tier in {"full", "light", "runtime"}
+                    and "reference" not in runtime_mode
+                )
+            )
+            row = {
+                "character_id": character_id,
+                "name": self._character_name(character_id),
+                "tier": tier,
+                "control": control,
+                "runtime_mode": runtime_mode,
+                "agent_awake": character_id in active_agent_ids,
+            }
+            if is_agent_controlled:
+                agent_controlled.append(row)
+            else:
+                passive_present.append(row)
+        contributors = []
+        seen_contributors = set()
+
+        def add_contributor(name, kind, status=""):
+            name = clean_text(name) if "clean_text" in globals() else str(name or "").strip()
+            kind = clean_text(kind) if "clean_text" in globals() else str(kind or "").strip()
+            status = clean_text(status) if "clean_text" in globals() else str(status or "").strip()
+            if not name:
+                return
+            marker = (name, kind, status)
+            if marker in seen_contributors:
+                return
+            seen_contributors.add(marker)
+            contributors.append({
+                "name": name,
+                "kind": kind,
+                "status": status,
+            })
+
+        if pipeline.get("player_controller"):
+            add_contributor("Player Controller", "角色控制", "ran")
+        if pipeline.get("time_agent"):
+            source = pipeline.get("time_agent", {}).get("source", "")
+            add_contributor(
+                "Time Service" if source else "Time Agent",
+                "时间",
+                "deterministic" if source else "ran",
+            )
+        rules = pipeline.get("rules_agent", {})
+        if rules:
+            add_contributor(
+                "Rule Checker",
+                "规则",
+                f"{rules.get('validation_count', 0)} checks",
+            )
+        for item in pipeline.get("nearby_npc_agents", []):
+            if not isinstance(item, dict):
+                continue
+            add_contributor(
+                item.get("canonical_name") or item.get("character_id"),
+                "Character Agent",
+                item.get("visible_behavior")
+                or item.get("action_intent", {}).get("description", "")
+                or "proposal",
+            )
+        group_controller = pipeline.get("group_controller", {})
+        if pipeline.get("group_controller_ran") or (
+            isinstance(group_controller, dict) and group_controller.get("ran")
+        ):
+            group_count = (
+                len(group_controller.get("groups", []))
+                if isinstance(group_controller, dict)
+                else 0
+            )
+            labels = []
+            if isinstance(group_controller, dict):
+                labels = [
+                    clean_text(item.get("label"))
+                    for item in group_controller.get("groups", [])
+                    if isinstance(item, dict) and clean_text(item.get("label"))
+                ]
+            add_contributor(
+                "Group Controller",
+                "群体",
+                "、".join(labels[:2]) if labels else f"groups x{group_count}",
+            )
+        local_world = pipeline.get("local_world_agent", {})
+        if pipeline.get("local_world_agent_ran") or local_world:
+            ambient_count = (
+                len(local_world.get("ambient_npc_reactions", []))
+                if isinstance(local_world, dict)
+                else 0
+            )
+            event_count = (
+                len(local_world.get("new_events", []))
+                if isinstance(local_world, dict)
+                else 0
+            )
+            status_parts = []
+            if isinstance(local_world, dict) and local_world.get("forced_progress"):
+                status_parts.append("forced reveal")
+            if ambient_count:
+                status_parts.append(f"ambient NPC x{ambient_count}")
+            if event_count:
+                status_parts.append(f"events x{event_count}")
+            add_contributor(
+                "Local World Agent",
+                "局部世界",
+                " / ".join(status_parts) if status_parts else "ran",
+            )
+        if pipeline.get("gm_resolver_ran") or pipeline.get("gm_resolver"):
+            add_contributor(
+                "GM Resolver",
+                "裁决",
+                pipeline.get("gm_resolver", {}).get(
+                    "outcome",
+                    "ran",
+                ),
+            )
+        if pipeline.get("global_world_agent_ran"):
+            add_contributor("Global World Agent", "大世界", "ran")
+        if pipeline.get("memory_agent"):
+            memory = pipeline.get("memory_agent", {})
+            add_contributor(
+                "Memory Agent",
+                "记忆",
+                (
+                    "compacted"
+                    if memory.get("summary_compaction_ran")
+                    else "recorded"
+                ),
+            )
+        if pipeline.get("scene_renderer"):
+            add_contributor("Scene Renderer", "叙事", "rendered")
+
+        if not pipeline and event:
+            if event.get("player_intent"):
+                add_contributor("Player Controller", "角色控制", "committed")
+            if event.get("elapsed_minutes") is not None:
+                add_contributor(
+                    "Time Service",
+                    "时间",
+                    f"{event.get('elapsed_minutes', 0)} min",
+                )
+            validation_summary = event.get("validation_summary", {})
+            if validation_summary:
+                add_contributor(
+                    "Rule Checker",
+                    "规则",
+                    validation_summary.get("status", "checked"),
+                )
+            for item in event.get("npc_agent_outputs", []):
+                if not isinstance(item, dict):
+                    continue
+                add_contributor(
+                    item.get("canonical_name") or item.get("character_id"),
+                    "Character Agent",
+                    item.get("visible_behavior")
+                    or item.get("action_intent", {}).get("description", "")
+                    or "proposal",
+                )
+            local_world = event.get("local_world", {})
+            group_controller = (
+                local_world.get("group_controller", {})
+                if isinstance(local_world, dict)
+                else {}
+            )
+            if isinstance(group_controller, dict) and group_controller.get("ran"):
+                labels = [
+                    clean_text(item.get("label"))
+                    for item in group_controller.get("groups", [])
+                    if isinstance(item, dict) and clean_text(item.get("label"))
+                ]
+                add_contributor(
+                    "Group Controller",
+                    "群体",
+                    "、".join(labels[:2]) if labels else "committed",
+                )
+            if isinstance(local_world, dict) and (
+                local_world.get("world_changes")
+                or local_world.get("new_events")
+                or local_world.get("ambient_npc_reactions")
+                or local_world.get("npc_position_updates")
+                or event.get("event_type") == "immersive_scene_turn"
+            ):
+                ambient_count = len(local_world.get("ambient_npc_reactions", []))
+                event_count = len(local_world.get("new_events", []))
+                status_parts = []
+                if local_world.get("forced_progress"):
+                    status_parts.append("forced reveal")
+                if ambient_count:
+                    status_parts.append(f"ambient NPC x{ambient_count}")
+                if event_count:
+                    status_parts.append(f"events x{event_count}")
+                add_contributor(
+                    "Local World Agent",
+                    "局部世界",
+                    " / ".join(status_parts) if status_parts else "committed",
+                )
+            gm = event.get("gm_resolution", {})
+            if isinstance(gm, dict) and gm:
+                add_contributor(
+                    "GM Resolver",
+                    "裁决",
+                    gm.get("outcome", "committed"),
+                )
+            if event.get("world_projection"):
+                add_contributor("Global World Agent", "大世界", "committed")
+            if event.get("event_type") == "immersive_scene_turn":
+                add_contributor("Memory Agent", "记忆", "recorded")
+                add_contributor("Scene Renderer", "叙事", "rendered")
+            elif event.get("event_type") == "scene_opening_rendered":
+                add_contributor("Scene Renderer", "叙事", "opening rendered")
+
+        return {
+            "active_controlled_agents": agent_controlled,
+            "active_passive_characters": passive_present,
+            "active_full_agents": agent_controlled,
+            "active_other_agents": passive_present,
+            "turn_contributors": contributors,
+            "scene": scene,
+            "event_id": event.get("event_id", "") if isinstance(event, dict) else "",
+            "revision": event.get("revision_after", "") if isinstance(event, dict) else "",
+            "pipeline": pipeline,
+        }
+
+    def _render_agent_trace(self, trace):
+        scene = trace.get("scene", {})
+        lines = []
+        lines.append("当前局部场景")
+        lines.append(f"地点：{scene.get('location_name') or scene.get('location_id') or '未定位'}")
+        lines.append(f"事件：{trace.get('event_id') or '暂无'}")
+        if trace.get("revision") != "":
+            lines.append(f"Revision：{trace.get('revision')}")
+        lines.append("")
+        lines.append("独立 Agent 控制")
+        controlled_agents = trace.get(
+            "active_controlled_agents",
+            trace.get("active_full_agents", []),
+        )
+        if controlled_agents:
+            for item in controlled_agents:
+                awake = " / 本轮已思考" if item.get("agent_awake") else ""
+                lines.append(
+                    f"- {item['name']} [{item.get('tier')}/{item['control']}{awake}]"
+                )
+        else:
+            lines.append("- 当前场景没有独立控制中的角色 Agent")
+        passive_characters = trace.get(
+            "active_passive_characters",
+            trace.get("active_other_agents", []),
+        )
+        if passive_characters:
+            lines.append("")
+            lines.append("在场但未独立思考")
+            for item in passive_characters:
+                lines.append(
+                    f"- {item['name']} [{item['tier']}/{item['control']}]"
+                )
+        lines.append("")
+        lines.append("本轮完成者")
+        contributors = trace.get("turn_contributors", [])
+        if contributors:
+            for item in contributors:
+                status = item.get("status", "")
+                suffix = f"：{status}" if status else ""
+                lines.append(
+                    f"- {item.get('name')} ({item.get('kind')}){suffix}"
+                )
+        else:
+            lines.append("- 等待下一轮运行")
+        return "\n".join(lines)
+
+    def _refresh_agent_trace(self, event=None):
+        if not hasattr(self, "agent_trace"):
+            return
+        trace = self._agent_trace_snapshot(event=event)
+        self._set_text(self.agent_trace, self._render_agent_trace(trace))
+
     def _show_latest_story(self, prefer_recovery=False):
         if prefer_recovery:
             recovery = self.store.runtime.get("recovery_snapshot") or {}
@@ -1099,11 +1559,13 @@ class SimulationApp:
                     ]
                 )
                 self._set_text(self.story, text)
+                self._refresh_agent_trace()
                 return
         events = self._story_events()
         text = events[-1].get("narration", "") if events else ""
         if text:
             self._set_text(self.story, text)
+        self._refresh_agent_trace(events[-1] if events else None)
 
     def _refresh_runtime_status(self):
         snapshot = self.store.snapshot()
@@ -1124,6 +1586,7 @@ class SimulationApp:
         self.story_progress_text.set(story_progress["label"])
         if focus_id:
             self._show_character_status(focus_id)
+        self._refresh_agent_trace()
 
     def _prepared_source_progress(self):
         graph_path = generated_db_path("graph", "raw_graph_triples.json")
@@ -1238,6 +1701,7 @@ class SimulationApp:
                     self.enter_button.configure(state="normal")
                     self.continue_button.configure(state="normal")
                     self.save_button.configure(state="normal")
+                    self.world_admin_send_button.configure(state="normal")
                     self.progress_value.set(100)
                     self.progress_text.set(
                         "Save complete"
@@ -1248,6 +1712,7 @@ class SimulationApp:
                     self.user_input.delete("1.0", "end")
                     self._show_latest_story()
                     self._refresh_runtime_status()
+                    self._refresh_agent_trace(payload)
                     pipeline = payload.get("pipeline", payload)
                     self._set_text(
                         self.diagnostics,
@@ -1257,9 +1722,37 @@ class SimulationApp:
                     self.enter_button.configure(state="normal")
                     self.continue_button.configure(state="normal")
                     self.save_button.configure(state="normal")
+                    self.world_admin_send_button.configure(state="normal")
                     self.progress_text.set("Operation failed")
                     self.eta_text.set("ETA: stopped")
                     messagebox.showerror("Simulation error", str(payload))
+                elif event == "world_admin_done":
+                    self.world_admin_send_button.configure(state="normal")
+                    self.progress_value.set(100)
+                    self.progress_text.set(
+                        "World admin applied changes"
+                        if payload.get("applied")
+                        else "World admin replied"
+                    )
+                    self.eta_text.set("ETA: complete")
+                    reply = payload.get("reply") or payload.get("plot_summary") or ""
+                    if payload.get("plot_summary") and payload.get("plot_summary") != reply:
+                        reply = reply + "\n\nCurrent plot:\n" + payload["plot_summary"]
+                    if payload.get("applied"):
+                        reply = reply + "\n\n[Applied runtime admin changes.]"
+                    self._append_world_admin("World admin", reply.strip() or "(No reply)")
+                    self._refresh_runtime_status()
+                    if self.selected_character_id:
+                        self._show_character_status(self.selected_character_id)
+                    self._set_text(
+                        self.diagnostics,
+                        json.dumps(payload, ensure_ascii=False, indent=2),
+                    )
+                elif event == "world_admin_error":
+                    self.world_admin_send_button.configure(state="normal")
+                    self.progress_text.set("World admin failed")
+                    self.eta_text.set("ETA: stopped")
+                    messagebox.showerror("World admin error", str(payload), parent=self.root)
                 elif event == "preview":
                     self.progress_text.set("Preview ready")
                     self.eta_text.set("ETA: --")

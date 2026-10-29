@@ -5505,7 +5505,7 @@ emit_progress(89, 'Building character state database')
 
 
 # %% Notebook cell 37
-STEP14_SCHEMA_VERSION = "3.4"
+STEP14_SCHEMA_VERSION = "3.5"
 STEP14_WORLD_GRAPH_PATH = Path("structured_world_graph.json")
 STEP14_NORMALIZED_PATH = Path("normalized_graph_triples.json")
 STEP14_OUTPUT_PATH = Path("character_state_db.json")
@@ -5663,6 +5663,229 @@ def assign_character_build_policy(character):
         "llm_enrichment_eligible": False,
         "runtime_upgrade_eligible": True,
         "reason": "minor_or_unresolved_character",
+    }
+
+
+def step14_clean_list(values, limit=10):
+    result = []
+    seen = set()
+    for value in values or []:
+        text = clean_graph_text(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def step14_character_basis_texts(character):
+    relation_texts = []
+    for relation in character.get("all_relations", []):
+        relation_texts.append(relation.get("name", ""))
+        relation_texts.append(relation.get("relation_type", ""))
+        for evidence in relation.get("evidence", [])[:3]:
+            relation_texts.append(evidence.get("source_text", ""))
+            relation_texts.append(evidence.get("relation_summary", ""))
+    return step14_clean_list(
+        [
+            character.get("background_summary", ""),
+            *character.get("background", []),
+            *character.get("goals", []),
+            *character.get("constraints", []),
+            *character.get("personality", []),
+            *character.get("knowledge_scope", []),
+            *[
+                item.get("source_text", "")
+                for item in character.get("evidence", [])
+            ],
+            *relation_texts,
+        ],
+        80,
+    )
+
+
+def build_identity_layers(character):
+    roleplay_identities = []
+    for name in step14_clean_list(
+        [
+            *character.get("temporary_identities", []),
+            *character.get("form_names", []),
+            *character.get("forms", []),
+        ],
+        12,
+    ):
+        roleplay_identities.append({
+            "identity": name,
+            "is_true_self": False,
+            "purpose": "临时身份、形态或伪装；用于行动策略，不等同本体",
+            "source": "identity_or_form_evidence",
+        })
+    subtypes = character.get("attributes", {}).get("entity_subtype", [])
+    if not isinstance(subtypes, list):
+        subtypes = [subtypes] if subtypes else []
+    true_self_parts = [character.get("canonical_name", "")]
+    if subtypes:
+        true_self_parts.append("、".join(step14_clean_list(subtypes, 4)))
+    true_self = true_self_parts[0]
+    if len(true_self_parts) > 1 and true_self_parts[1]:
+        true_self += f"（{true_self_parts[1]}）"
+    return {
+        "true_self": true_self,
+        "canonical_identity": character.get("canonical_name", ""),
+        "stable_names": step14_clean_list(
+            [
+                character.get("canonical_name", ""),
+                *character.get("aliases", []),
+                *character.get("titles", []),
+            ],
+            16,
+        ),
+        "roleplay_identities": roleplay_identities,
+        "policy": (
+            "模拟时本体、根本欲望与长期目标优先；伪装、化身、称号、"
+            "临时职业或日常外壳只能作为达成目的的策略。"
+        ),
+    }
+
+
+def build_motivation_action_policy(
+    root_drives,
+    current_objectives,
+    fears,
+    strategy_patterns,
+    temptations,
+    trigger_rules,
+):
+    text = "；".join(
+        clean_graph_text(item)
+        for item in [
+            *root_drives,
+            *current_objectives,
+            *fears,
+            *strategy_patterns,
+            *temptations,
+            *trigger_rules,
+        ]
+        if clean_graph_text(item)
+    )
+    pursues_tang = "唐僧" in text or "唐僧肉" in text
+    has_high_threat = any(
+        word in text
+        for word in ("孙悟空", "悟空", "火眼金睛", "识破", "暴露", "降伏", "诛杀")
+    )
+    uses_disguise = any(
+        word in text
+        for word in ("伪装", "变身", "化身", "临时身份", "骗", "诱")
+    )
+    forward_actions = ["观察", "试探", "换策略", "保留下一步机会"]
+    if uses_disguise:
+        forward_actions.extend(["维护伪装", "变换身份", "制造误判"])
+    if pursues_tang:
+        forward_actions.extend(["接近唐僧", "诱导唐僧", "分散护卫注意"])
+    if has_high_threat:
+        forward_actions.extend(["绕开孙悟空视线", "拉开风险距离", "等待护卫破绽"])
+    return {
+        "priority": "根本欲望决定方向；恐惧只改变路线、节奏和伪装强度。",
+        "when_threatened": (
+            "高威胁下先隐蔽推进核心目标：维护伪装、换身份、转移视线、"
+            "分散威胁、试探目标或制造机会；暂避必须同时保留下一步机会。"
+        ),
+        "stall_guard": (
+            "除非玩家明确要求或角色被外力限制，不要整轮只屏息、僵住、"
+            "装死、扮石头或反复描写恐惧；停顿之后必须出现目标导向的判断或动作。"
+        ),
+        "action_bias": (
+            "risk_managed_pursuit"
+            if pursues_tang and has_high_threat
+            else "goal_directed_survival"
+        ),
+        "forward_actions": step14_clean_list(forward_actions, 12),
+        "risk_can_override_goal": False,
+    }
+
+
+def build_core_motivation(character):
+    basis = step14_character_basis_texts(character)
+    basis_text = "；".join(basis)
+    canonical_name = character.get("canonical_name", "")
+    identity_layers = character.get("identity_layers") or build_identity_layers(
+        character
+    )
+    root_drives = step14_clean_list(character.get("goals", []), 12)
+    current_objectives = step14_clean_list(character.get("goals", []), 12)
+    fears = step14_clean_list(character.get("constraints", []), 12)
+    attachments = []
+    temptations = []
+    moral_constraints = []
+    strategy_patterns = []
+    trigger_rules = []
+    emotional_baseline = step14_clean_list(character.get("personality", []), 8)
+    inference_notes = []
+
+    if "唐僧肉" in basis_text:
+        temptations.append("唐僧肉")
+        trigger_rules.append("看见或确认唐僧会触发接近、诱骗、捕获或下手判断")
+        if "骗" in basis_text or "变身" in basis_text:
+            current_objectives.append("通过变身或伪装接近唐僧并骗取唐僧肉")
+            strategy_patterns.extend(["伪装弱者或普通人", "利用目标的慈悲与戒心漏洞"])
+        else:
+            current_objectives.append("围绕唐僧肉寻找机会")
+        root_drives.append("获取唐僧肉带来的生存、修为或长生利益")
+        emotional_baseline.extend(["贪求", "戒备"])
+        inference_notes.append("唐僧肉常作为长生与修为利益目标；此处由行动对象保守推断")
+    if "变身" in basis_text or identity_layers.get("roleplay_identities"):
+        strategy_patterns.append("使用伪装、变身或临时身份接近目标")
+        trigger_rules.append("身份可能暴露时维护伪装、换策略或暂避，但仍服务核心目标")
+    if "火眼金睛" in basis_text or "识破妖怪" in basis_text:
+        fears.append("孙悟空的火眼金睛或识破能力")
+        trigger_rules.append("孙悟空靠近或审视时触发暴露风险判断")
+    if "紧箍咒" in basis_text and ("孙悟空" in basis_text or "悟空" in basis_text):
+        trigger_rules.append("唐僧牵制孙悟空时会改变风险与机会判断")
+    if "妖怪" in basis_text or canonical_name.endswith("精"):
+        root_drives.append("保全妖怪本体并延续修行")
+        fears.append("本体暴露后遭到降伏或诛杀")
+    for relation in character.get("all_relations", []):
+        relation_type = relation.get("relation_type", "")
+        name = relation.get("name", "")
+        if relation_type in {
+            "PROTECTS", "PARENT_OF", "CHILD_OF", "MASTER_OF",
+            "DISCIPLE_OF", "TRAVELS_WITH", "ACCOMPANIES",
+        }:
+            attachments.append(name)
+        if relation_type in {"FIGHTS_WITH", "HAS_CONFLICT_WITH", "OPPOSES"}:
+            fears.append(f"与{name}的冲突升级")
+            trigger_rules.append(f"{name}出现或行动会触发戒备、反击或回避判断")
+    if not root_drives:
+        root_drives.append("维持本体生存，并按身份、关系和处境追求利益")
+        inference_notes.append("未抽到显式根本欲望，使用生存与处境利益作为保守兜底")
+    if not current_objectives:
+        current_objectives.append("延续当前处境中最符合本体利益的目标")
+    if not emotional_baseline:
+        emotional_baseline.append("情绪底色未知，按本体利益和当前压力反应")
+    return {
+        "true_self": identity_layers.get("true_self", canonical_name),
+        "root_drives": step14_clean_list(root_drives, 12),
+        "current_objectives": step14_clean_list(current_objectives, 12),
+        "fears": step14_clean_list(fears, 12),
+        "attachments": step14_clean_list(attachments, 12),
+        "temptations": step14_clean_list(temptations, 12),
+        "moral_constraints": step14_clean_list(moral_constraints, 12),
+        "strategy_patterns": step14_clean_list(strategy_patterns, 12),
+        "trigger_rules": step14_clean_list(trigger_rules, 12),
+        "emotional_baseline": step14_clean_list(emotional_baseline, 8),
+        "identity_policy": identity_layers.get("policy", ""),
+        "action_policy": build_motivation_action_policy(
+            root_drives,
+            current_objectives,
+            fears,
+            strategy_patterns,
+            temptations,
+            trigger_rules,
+        ),
+        "source_basis": basis[:16],
+        "inference_notes": step14_clean_list(inference_notes, 8),
     }
 
 
@@ -5896,6 +6119,8 @@ def build_character_state_db(world_graph, normalized):
             "attributes": entity.get("attributes", {}),
             "personality": [],
             "identities": identities,
+            "identity_layers": {},
+            "core_motivation": {},
             **fields,
             "all_relations": all_relations,
             "source_chunk_ids": source_chunk_ids,
@@ -6000,7 +6225,9 @@ def enrich_character_state(character):
     character.get("data_status", {}).get("language_profile")
 )}
 
-Create a concise state update for this character.
+Create a concise state update for this character. The key goal is to make the
+character simulate from selfhood, desire, fear, attachment and strategy, not
+from plot motions alone. Separate true self from performed/temporary identities.
 Return:
 {{
   "background_summary": "1-3 evidence-bound sentences",
@@ -6008,7 +6235,25 @@ Return:
   "speech_styles": ["observed speech feature"],
   "goals": ["explicit goal"],
   "constraints": ["explicit limitation"],
-  "knowledge_scope": ["explicitly known information"]
+  "knowledge_scope": ["explicitly known information"],
+  "identity_layers": {{
+    "true_self": "stable inner identity",
+    "roleplay_identities": [
+      {{"identity": "performed or disguised identity", "purpose": "why it is used", "is_true_self": false}}
+    ]
+  }},
+  "core_motivation": {{
+    "root_drives": ["deep desire or need, evidence-bound or cautious inference"],
+    "current_objectives": ["current concrete objective"],
+    "fears": ["what threatens the character"],
+    "attachments": ["who or what the character cares about"],
+    "temptations": ["what can lure the character into action"],
+    "moral_constraints": ["what the character resists doing or feels bound by"],
+    "strategy_patterns": ["habitual way of pursuing goals"],
+    "trigger_rules": ["if the character sees/hears X, it tends to judge/do Y"],
+    "emotional_baseline": ["dominant emotional tones"],
+    "action_policy_hint": "how fear changes route without replacing the root objective"
+  }}
 }}
 
 Character evidence:
@@ -6068,6 +6313,59 @@ Character evidence:
                     character["data_status"]["language_profile"],
                 )
             ][:10]
+    identity_payload = payload.get("identity_layers", {})
+    if isinstance(identity_payload, dict):
+        roleplay_items = []
+        for item in identity_payload.get("roleplay_identities", []):
+            if not isinstance(item, dict):
+                continue
+            identity = clean_graph_text(item.get("identity", ""))
+            if not identity:
+                continue
+            roleplay_items.append({
+                "identity": identity,
+                "purpose": clean_graph_text(item.get("purpose", "")),
+                "is_true_self": False,
+                "source": "step14_llm_enrichment",
+            })
+        character["identity_layers"] = {
+            **build_identity_layers(character),
+            "true_self": clean_graph_text(
+                identity_payload.get("true_self", "")
+            ) or build_identity_layers(character)["true_self"],
+            "roleplay_identities": roleplay_items
+                or build_identity_layers(character)["roleplay_identities"],
+        }
+    motivation_payload = payload.get("core_motivation", {})
+    if isinstance(motivation_payload, dict):
+        base_motivation = build_core_motivation(character)
+        for field in (
+            "root_drives",
+            "current_objectives",
+            "fears",
+            "attachments",
+            "temptations",
+            "moral_constraints",
+            "strategy_patterns",
+            "trigger_rules",
+            "emotional_baseline",
+        ):
+            base_motivation[field] = step14_clean_list(
+                [
+                    *base_motivation.get(field, []),
+                    *motivation_payload.get(field, []),
+                ],
+                12,
+            )
+        base_motivation["action_policy"] = build_motivation_action_policy(
+            base_motivation.get("root_drives", []),
+            base_motivation.get("current_objectives", []),
+            base_motivation.get("fears", []),
+            base_motivation.get("strategy_patterns", []),
+            base_motivation.get("temptations", []),
+            base_motivation.get("trigger_rules", []),
+        )
+        character["core_motivation"] = base_motivation
     return character
 
 
@@ -6113,6 +6411,22 @@ for character in character_state_db["characters"]:
                 if evidence.get("source_text")
             )
         character["constraints"] = list(dict.fromkeys(explicit_constraints))[:10]
+    character["identity_layers"] = {
+        **build_identity_layers(character),
+        **(character.get("identity_layers") or {}),
+    }
+    character["core_motivation"] = {
+        **build_core_motivation(character),
+        **(character.get("core_motivation") or {}),
+    }
+    character["core_motivation"]["action_policy"] = build_motivation_action_policy(
+        character["core_motivation"].get("root_drives", []),
+        character["core_motivation"].get("current_objectives", []),
+        character["core_motivation"].get("fears", []),
+        character["core_motivation"].get("strategy_patterns", []),
+        character["core_motivation"].get("temptations", []),
+        character["core_motivation"].get("trigger_rules", []),
+    )
 
 character_state_db["profile_coverage"] = {
     field: sum(
@@ -6122,6 +6436,7 @@ character_state_db["profile_coverage"] = {
     for field in (
         "background_summary", "personality", "speech_styles", "goals",
         "conflicts", "constraints", "knowledge_scope",
+        "identity_layers", "core_motivation",
     )
 }
 character_state_db["character_by_id"] = {
@@ -8142,6 +8457,8 @@ def step16_missing_fields(character):
         "owned_items": character.get("owned_items"),
         "companions": character.get("companions"),
         "locations": character.get("locations"),
+        "identity_layers": character.get("identity_layers"),
+        "core_motivation": character.get("core_motivation"),
     }
     return [
         field for field, value in checks.items() if not value
@@ -8178,6 +8495,40 @@ def step16_prompt_text(profile, project_language):
         summary = profile["state"]["background_summary"]
         if summary:
             lines.append("背景：" + summary)
+        core = profile.get("core_motivation", {})
+        if core:
+            lines.append(
+                "角色根基："
+                + clean_graph_text(core.get("true_self", ""))
+            )
+            if core.get("root_drives"):
+                lines.append("根本欲望：" + "、".join(core["root_drives"]))
+            if core.get("current_objectives"):
+                lines.append(
+                    "当前真实目的：" + "、".join(core["current_objectives"])
+                )
+            if core.get("fears"):
+                lines.append("恐惧与压力：" + "、".join(core["fears"]))
+            if core.get("attachments"):
+                lines.append("牵挂：" + "、".join(core["attachments"]))
+            if core.get("temptations"):
+                lines.append("诱惑：" + "、".join(core["temptations"]))
+            if core.get("strategy_patterns"):
+                lines.append("惯用策略：" + "、".join(core["strategy_patterns"]))
+            if core.get("trigger_rules"):
+                lines.append("触发判断：" + "；".join(core["trigger_rules"]))
+            if core.get("action_policy"):
+                policy = core["action_policy"]
+                lines.append(
+                    "风险行动原则："
+                    + clean_graph_text(policy.get("priority", ""))
+                    + clean_graph_text(policy.get("when_threatened", ""))
+                    + clean_graph_text(policy.get("stall_guard", ""))
+                )
+            lines.append(
+                "行动原则：先由本体、欲望、恐惧、牵挂与当前目的决定行动；"
+                "临时身份、伪装和日常外壳只能作为策略。"
+            )
         if profile["relationships"]:
             lines.append(
                 "关系："
@@ -8209,6 +8560,34 @@ def step16_prompt_text(profile, project_language):
     summary = profile["state"]["background_summary"]
     if summary:
         lines.append("Background: " + summary)
+    core = profile.get("core_motivation", {})
+    if core:
+        lines.append("True self: " + clean_graph_text(core.get("true_self", "")))
+        if core.get("root_drives"):
+            lines.append("Root drives: " + "; ".join(core["root_drives"]))
+        if core.get("current_objectives"):
+            lines.append(
+                "Current true objectives: "
+                + "; ".join(core["current_objectives"])
+            )
+        if core.get("fears"):
+            lines.append("Fears and pressures: " + "; ".join(core["fears"]))
+        if core.get("strategy_patterns"):
+            lines.append("Strategies: " + "; ".join(core["strategy_patterns"]))
+        if core.get("trigger_rules"):
+            lines.append("Trigger rules: " + "; ".join(core["trigger_rules"]))
+        if core.get("action_policy"):
+            policy = core["action_policy"]
+            lines.append(
+                "Risk action policy: "
+                + clean_graph_text(policy.get("priority", ""))
+                + clean_graph_text(policy.get("when_threatened", ""))
+                + clean_graph_text(policy.get("stall_guard", ""))
+            )
+        lines.append(
+            "Act from true self, desire, fear, attachment and current objective; "
+            "performed identities are strategies, not the inner self."
+        )
     if profile["relationships"]:
         lines.append(
             "Relationships: "
@@ -8300,6 +8679,30 @@ def build_step16_profile(character, world_db, canonical_ids):
         "identity_source": "step11_canonical_character_id",
         "identity_rule": "one_runtime_agent_per_character_id",
     }
+    identity_layers = character.get("identity_layers") or {
+        "true_self": character["canonical_name"],
+        "canonical_identity": character["canonical_name"],
+        "stable_names": identity["canonical_identity_names"],
+        "roleplay_identities": [],
+        "policy": (
+            "模拟时本体、根本欲望与长期目标优先；临时身份只是策略。"
+        ),
+    }
+    core_motivation = character.get("core_motivation") or {
+        "true_self": identity_layers.get("true_self", character["canonical_name"]),
+        "root_drives": character.get("goals", []),
+        "current_objectives": character.get("goals", []),
+        "fears": character.get("constraints", []),
+        "attachments": [],
+        "temptations": [],
+        "moral_constraints": [],
+        "strategy_patterns": [],
+        "trigger_rules": [],
+        "emotional_baseline": character.get("personality", []),
+        "identity_policy": identity_layers.get("policy", ""),
+        "source_basis": character.get("background", [])[:8],
+        "inference_notes": [],
+    }
     state = {
         "background_summary": clean_graph_text(
             character.get("background_summary", "")
@@ -8322,6 +8725,8 @@ def build_step16_profile(character, world_db, canonical_ids):
         ),
         "simulation_status": character["simulation_status"],
         "identity": identity,
+        "identity_layers": identity_layers,
+        "core_motivation": core_motivation,
         "state": state,
         "capabilities": {
             "abilities": character.get("abilities", []),
@@ -8391,6 +8796,12 @@ def build_step16_profile(character, world_db, canonical_ids):
         *identity["titles"],
         *identity["forms"],
         *identity["temporary_identities"],
+        *core_motivation.get("root_drives", []),
+        *core_motivation.get("current_objectives", []),
+        *core_motivation.get("fears", []),
+        *core_motivation.get("temptations", []),
+        *core_motivation.get("strategy_patterns", []),
+        *core_motivation.get("trigger_rules", []),
         *[item for item in ability_tags if item],
         *[item for item in item_tags if item],
         *(item["name"] for item in relations),
@@ -8629,6 +9040,7 @@ runtime_agent_state_db = write_runtime_agent_state_file(
 )
 project_data["agent_profiles_path"] = str(STEP16_OUTPUT_PATH)
 project_data["runtime_agent_state_path"] = "runtime_agent_state.json"
+project_data["runtime_motivation_state_path"] = "runtime_motivation_state.json"
 published_databases = publish_generated_databases(Path("."))
 removed_root_database_files = cleanup_root_database_files(
     Path("."),

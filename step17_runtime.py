@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -352,6 +353,32 @@ class SimulationStore:
             }
             for item in self.character_db.get("characters", [])
         }
+        motivation_runtime = {
+            item["character_id"]: {
+                "character_id": item["character_id"],
+                "dominant_drive": "",
+                "active_objective": "",
+                "active_fear": "",
+                "current_strategy": "",
+                "desire_intensity": 0,
+                "fear_intensity": 0,
+                "attachment_focus": "",
+                "temptation_focus": "",
+                "disguise_pressure": 0,
+                "action_policy": {
+                    "priority": "根本欲望决定方向；恐惧只改变路线、节奏和伪装强度。",
+                    "when_threatened": "采取保守、试探或隐蔽推进，不能把停滞当作长期目标。",
+                    "stall_guard": "除非玩家明确要求或角色被外力限制，不要整轮只屏息、僵住、装死或扮作无生命物。",
+                    "action_bias": "goal_directed_survival",
+                    "forward_actions": ["观察", "试探", "换策略", "保留下一步机会"],
+                },
+                "confidence": "unknown",
+                "last_trigger": "",
+                "last_updated_by_event_id": None,
+                "history": [],
+            }
+            for item in self.character_db.get("characters", [])
+        }
         baseline = {
             "entity_states": self._base_entity_states(),
             "resource_states": self._base_resource_states(),
@@ -380,6 +407,7 @@ class SimulationStore:
             "backend_log": [],
             "pending_actions": [],
             "character_runtime": character_runtime,
+            "motivation_runtime": motivation_runtime,
             "location_runtime": {},
             "active_events": [],
             "runtime_event_db": self._base_runtime_events(),
@@ -406,6 +434,8 @@ class SimulationStore:
             "branch_records": [],
             "long_term_memories": {},
             "world_knowledge_cache": {},
+            "admin_profile_overrides": {},
+            "world_admin_log": [],
         }
         return {
             "branch_id": branch_id,
@@ -475,6 +505,7 @@ class SimulationStore:
                     "backend_log",
                     "pending_actions",
                     "character_runtime",
+                    "motivation_runtime",
                     "location_runtime",
                     "active_events",
                     "resource_states",
@@ -493,6 +524,8 @@ class SimulationStore:
                     "world_knowledge_cache",
                     "recent_dialogue_turns",
                     "recovery_snapshot",
+                    "admin_profile_overrides",
+                    "world_admin_log",
                 ):
                     if key not in target:
                         target[key] = deep_copy(defaults[key])
@@ -611,6 +644,11 @@ class SimulationStore:
             agent_state["memory_last_revision"] = memory.get(
                 "last_revision", 0
             )
+            agent_state["motivation_runtime"] = deep_copy(
+                self.runtime.get("motivation_runtime", {}).get(
+                    character_id, {}
+                )
+            )
 
         runtime_log = deep_copy(self.runtime.get("runtime_log") or {})
         runtime_log.setdefault("schema_version", STEP17_SCHEMA_VERSION)
@@ -651,6 +689,10 @@ class SimulationStore:
         atomic_write_json(
             self.agents_dir / "runtime_agent_state.json",
             self.runtime.get("runtime_agent_state", {}),
+        )
+        atomic_write_json(
+            self.agents_dir / "runtime_motivation_state.json",
+            self.runtime.get("motivation_runtime", {}),
         )
         agent_db_dir = self.agents_dir / "runtime_agent_dbs"
         agent_db_dir.mkdir(parents=True, exist_ok=True)
@@ -716,8 +758,9 @@ class SimulationStore:
         }
 
     def _commit_system_event(self, event_type, **payload):
+        event_id = "event_" + uuid.uuid4().hex[:16]
         event = {
-            "event_id": "event_" + uuid.uuid4().hex[:16],
+            "event_id": event_id,
             "idempotency_key": payload.pop(
                 "idempotency_key",
                 f"{event_type}:{uuid.uuid4().hex}",
@@ -1831,6 +1874,369 @@ class SimulationOrchestrator:
         self.agent_by_character_id = {
             item["character_id"]: item for item in agent_profiles.get("agents", [])
         }
+        self.knowledge_unit_index = self._build_knowledge_unit_index()
+
+    def _runtime_npc_profiles(self):
+        return self.store.runtime.setdefault("runtime_npc_profiles", {})
+
+    def _is_runtime_character(self, character_id):
+        return clean_text(character_id) in self._runtime_npc_profiles()
+
+    def _is_known_character_id(self, character_id):
+        character_id = clean_text(character_id)
+        return character_id in self.character_by_id or self._is_runtime_character(character_id)
+
+    def _runtime_npc_id(self, label, location_id):
+        label = clean_text(label) or "附近人物"
+        location_id = clean_text(location_id) or "unknown_location"
+        return "runtime_npc_" + stable_hash(
+            {
+                "label": label,
+                "location_id": location_id,
+            }
+        )[:16]
+
+    def _matching_runtime_npc_ids(self, label, location_id=""):
+        label = clean_text(label)
+        location_id = clean_text(location_id)
+        if not label:
+            return []
+        matches = []
+        active_scene = self.store.runtime.get("active_scene") or {}
+        active_ids = set(active_scene.get("participant_ids", []))
+        runtime = self.store.runtime.get("character_runtime", {})
+        memories = self.store.runtime.get("agent_memories", {})
+        for character_id, profile in self._runtime_npc_profiles().items():
+            identity = profile.get("identity", {}) if isinstance(profile, dict) else {}
+            names = {
+                clean_text(profile.get("canonical_name")),
+                clean_text(profile.get("display_name")),
+                *[clean_text(item) for item in identity.get("aliases", [])],
+                *[
+                    clean_text(item)
+                    for item in identity.get("canonical_identity_names", [])
+                ],
+            }
+            if label not in names:
+                continue
+            state = runtime.get(character_id, {})
+            state_location = clean_text(state.get("current_location"))
+            profile_location = clean_text(
+                (profile.get("attributes") or {}).get("location_id")
+            )
+            same_location = bool(
+                location_id
+                and (state_location == location_id or profile_location == location_id)
+            )
+            active_here = character_id in active_ids
+            active_state = self._availability_is_active(state.get("availability"))
+            memory_revision = bounded_int(
+                memories.get(character_id, {}).get("last_revision"),
+                default=0,
+                minimum=0,
+            )
+            matches.append(
+                (
+                    1 if active_here else 0,
+                    1 if same_location else 0,
+                    1 if active_state else 0,
+                    memory_revision,
+                    character_id,
+                )
+            )
+        matches.sort(reverse=True)
+        return [item[-1] for item in matches]
+
+    def _existing_runtime_npc_id(self, label, location_id=""):
+        matches = self._matching_runtime_npc_ids(label, location_id)
+        if not matches:
+            return ""
+        return matches[0]
+
+    def _runtime_npc_profile(
+        self,
+        character_id,
+        label,
+        location_id,
+        seed_event_id="",
+        memory_text="",
+    ):
+        label = clean_text(label) or "附近人物"
+        location_name = self._location_name(location_id)
+        return {
+            "agent_id": "agent_" + character_id,
+            "character_id": character_id,
+            "canonical_name": label,
+            "profile_tier": "runtime",
+            "runtime_mode": "runtime_ambient_promoted_agent",
+            "simulation_status": "local_runtime_npc",
+            "identity": {
+                "canonical_name": label,
+                "aliases": [label],
+                "titles": [],
+                "forms": [],
+                "temporary_identities": [],
+                "canonical_identity_names": [label],
+                "identity_source": "runtime_ambient_npc_promotion",
+                "identity_rule": "one_runtime_agent_per_label_and_location",
+            },
+            "state": {
+                "background_summary": (
+                    f"{label}是当前局部场景中的普通人物，位于"
+                    f"{location_name or location_id}。"
+                ),
+                "personality": [
+                    "普通人，会根据恐惧、利益、习惯和眼前威胁作出反应。"
+                ],
+                "goals": [
+                    "保全自身",
+                    "保护自己的住处、同伴或日常生活不被牵连",
+                    "回答、回避、拖延或误导强势角色的追问",
+                    "一旦出现合理机会，可以逃离、求援、躲藏或改变路线",
+                ],
+                "constraints": [
+                    "没有超出普通人证据范围的知识或能力。",
+                    "不是玩家的工具；只会在恐惧、利益或现实压力下暂时配合。",
+                ],
+                "speech_styles": ["紧张、朴素、符合当地普通人的说话方式。"],
+                "knowledge_scope": [
+                    "只能知道自己亲历、听闻或本地传言中的事情。",
+                    "不知道其他角色内心，也不知道原著未来。",
+                ],
+            },
+            "core_motivation": {
+                "true_self": label,
+                "true_identity_name": label,
+                "root_drives": ["保全自身和日常生活"],
+                "current_true_objectives": [
+                    "活过当前威胁",
+                    "尽量让危险远离自己熟悉的人和地点",
+                ],
+                "current_objectives": [
+                    "活过当前威胁",
+                    "尽量让危险远离自己熟悉的人和地点",
+                ],
+                "fears_or_constraints": [
+                    "害怕强势角色迁怒",
+                    "害怕说错话招来危险",
+                    "只能依据亲历、听闻和本地传言行动",
+                ],
+                "strategy_identities": [
+                    "求饶",
+                    "顺从",
+                    "指路",
+                    "拖延",
+                    "误导",
+                    "伺机逃离",
+                    "求援",
+                ],
+                "action_policy": {
+                    "priority": "保命和保护自身生活优先；恐惧会改变路线，也可以触发逃离、求援、躲藏或误导。",
+                    "when_threatened": (
+                        "高威胁下可以暂时顺从，但必须继续寻找自保机会；"
+                        "如果出现距离、遮蔽物、旁人或混乱等机会，可以逃跑、求援、"
+                        "拖延、绕路或给出对自己更安全的信息。"
+                    ),
+                    "stall_guard": (
+                        "不要整轮只反复发抖、磕头或求饶；恐惧之后必须出现"
+                        "保命判断、信息取舍或具体行动。"
+                    ),
+                    "action_bias": "self_preserving_autonomy",
+                    "forward_actions": [
+                        "观察威胁",
+                        "判断退路",
+                        "顺从以降低威胁",
+                        "拖延",
+                        "误导",
+                        "逃离",
+                        "求援",
+                        "躲藏",
+                    ],
+                    "risk_can_override_goal": True,
+                },
+            },
+            "attributes": {
+                "runtime_created": True,
+                "source_event_id": clean_text(seed_event_id),
+                "location_id": clean_text(location_id),
+            },
+            "capabilities": {
+                "abilities": [],
+                "owned_items": [],
+                "used_items": [],
+            },
+            "relationships": [],
+            "weak_relation_candidates": [],
+            "metadata_relation_candidates": [],
+            "world_context": {
+                "knowledge_refs": [],
+                "supported_retrieval_candidates": [],
+            },
+            "memories": [
+                {
+                    "source_text": clean_text(memory_text),
+                    "relation_summary": clean_text(memory_text),
+                    "source_event_id": clean_text(seed_event_id),
+                }
+            ] if clean_text(memory_text) else [],
+            "evidence_refs": [],
+            "guardrails": {
+                "runtime_ambient_npc": True,
+                "evidence_only": True,
+                "unsupported_fields_must_remain_unknown": True,
+            },
+        }
+
+    def _runtime_npc_profile_with_autonomy(self, profile):
+        profile = deep_copy(profile or {})
+        if not (profile.get("guardrails") or {}).get("runtime_ambient_npc"):
+            return profile
+        label = clean_text(profile.get("canonical_name")) or "附近人物"
+        state = profile.setdefault("state", {})
+        state["personality"] = compact_list(
+            [
+                *state.get("personality", []),
+                "会根据恐惧、利益、习惯和眼前威胁作出反应。",
+            ],
+            8,
+        )
+        state["goals"] = compact_list(
+            [
+                *state.get("goals", []),
+                "保全自身",
+                "保护自己的住处、同伴或日常生活不被牵连",
+                "回答、回避、拖延或误导强势角色的追问",
+                "一旦出现合理机会，可以逃离、求援、躲藏或改变路线",
+            ],
+            12,
+        )
+        state["constraints"] = compact_list(
+            [
+                *state.get("constraints", []),
+                "没有超出普通人证据范围的知识或能力。",
+                "不是玩家的工具；只会在恐惧、利益或现实压力下暂时配合。",
+            ],
+            10,
+        )
+        core = profile.setdefault("core_motivation", {})
+        core.setdefault("true_self", label)
+        core.setdefault("true_identity_name", label)
+        core["root_drives"] = compact_list(
+            [*core.get("root_drives", []), "保全自身和日常生活"],
+            8,
+        )
+        core["current_true_objectives"] = compact_list(
+            [
+                *core.get("current_true_objectives", []),
+                *core.get("current_objectives", []),
+                "活过当前威胁",
+                "尽量让危险远离自己熟悉的人和地点",
+            ],
+            10,
+        )
+        core["current_objectives"] = deep_copy(core["current_true_objectives"])
+        core["fears_or_constraints"] = compact_list(
+            [
+                *core.get("fears_or_constraints", []),
+                *core.get("fears", []),
+                "害怕强势角色迁怒",
+                "害怕说错话招来危险",
+                "只能依据亲历、听闻和本地传言行动",
+            ],
+            10,
+        )
+        core["strategy_identities"] = compact_list(
+            [
+                *core.get("strategy_identities", []),
+                *core.get("strategy_patterns", []),
+                "求饶",
+                "顺从",
+                "指路",
+                "拖延",
+                "误导",
+                "伺机逃离",
+                "求援",
+            ],
+            12,
+        )
+        core["action_policy"] = {
+            "priority": "保命和保护自身生活优先；恐惧会改变路线，也可以触发逃离、求援、躲藏、拖延或误导。",
+            "when_threatened": (
+                "高威胁下可以暂时顺从，但必须继续寻找自保机会；"
+                "如果出现距离、遮蔽物、旁人或混乱等机会，可以逃跑、求援、"
+                "拖延、绕路或给出对自己更安全的信息。"
+            ),
+            "stall_guard": (
+                "不要整轮只反复发抖、磕头或求饶；恐惧之后必须出现"
+                "保命判断、信息取舍或具体行动。"
+            ),
+            "action_bias": "self_preserving_autonomy",
+            "forward_actions": [
+                "观察威胁",
+                "判断退路",
+                "顺从以降低威胁",
+                "拖延",
+                "误导",
+                "逃离",
+                "求援",
+                "躲藏",
+            ],
+            "risk_can_override_goal": True,
+        }
+        return profile
+
+    def _build_knowledge_unit_index(self):
+        rows = []
+        for unit in self.world_db.get("knowledge_units", []):
+            status = unit.get("model_status", "unresolved")
+            if status not in {"trusted", "supported"}:
+                continue
+            haystack = " ".join(
+                clean_text(item)
+                for item in [
+                    unit.get("name", ""),
+                    unit.get("category", ""),
+                    *unit.get("retrieval_tags", []),
+                    *unit.get("descriptions", []),
+                ]
+                if clean_text(item)
+            ).casefold()
+            if not haystack:
+                continue
+            rows.append({
+                "unit": unit,
+                "haystack": haystack,
+                "status": status,
+                "trusted": status == "trusted",
+            })
+        return rows
+
+    @staticmethod
+    def _term_score(haystack, terms):
+        score = 0
+        matched = []
+        for term in terms:
+            term = clean_text(term).casefold()
+            if len(term) < 2:
+                continue
+            if term in haystack:
+                score += 1 + min(len(term), 8) / 8
+                matched.append(term)
+        return score, compact_list(matched, 16)
+
+    def _search_knowledge_units(self, terms, limit=None):
+        scored = []
+        for row in self.knowledge_unit_index:
+            score, matched = self._term_score(row["haystack"], terms)
+            if not score:
+                continue
+            unit = deep_copy(row["unit"])
+            unit["_retrieval_score"] = round(score, 3)
+            unit["_matched_terms"] = matched
+            scored.append((score, row["trusted"], unit))
+        scored.sort(key=lambda item: (-item[0], not item[1], item[2].get("name", "")))
+        units = [item[2] for item in scored]
+        return units[:limit] if limit else units
 
     def _resource_is_current_for_character(self, resource_id, character_id, modes):
         if not resource_id:
@@ -1964,12 +2370,1056 @@ class SimulationOrchestrator:
             profile.get("relationships", []),
             24,
         )
+        profile["core_motivation"] = self._infer_core_motivation(profile)
+        profile = self._profile_with_admin_overrides(profile)
         return profile
+
+    def _profile_with_admin_overrides(self, profile):
+        character_id = profile.get("character_id")
+        overrides = (
+            self.store.runtime.get("admin_profile_overrides", {})
+            .get(character_id, {})
+        )
+        if not isinstance(overrides, dict) or not overrides:
+            return profile
+        profile = deep_copy(profile)
+        profile["admin_profile_overrides"] = deep_copy(overrides)
+        state_override = overrides.get("state", {})
+        if isinstance(state_override, dict):
+            state = profile.setdefault("state", {})
+            for key, value in state_override.items():
+                if value not in (None, "", [], {}):
+                    state[key] = deep_copy(value)
+        for key in ("personality", "goals", "constraints", "speech_styles", "knowledge_scope"):
+            if key in overrides and overrides[key] not in (None, "", [], {}):
+                profile.setdefault("state", {})[key] = deep_copy(overrides[key])
+        core_override = overrides.get("core_motivation", {})
+        if isinstance(core_override, dict) and core_override:
+            core = deep_copy(profile.get("core_motivation", {}))
+            for key, value in core_override.items():
+                if value not in (None, "", [], {}):
+                    core[key] = deep_copy(value)
+            core["action_policy"] = self._motivation_action_policy(core)
+            profile["core_motivation"] = core
+        identity_override = overrides.get("identity", {})
+        if isinstance(identity_override, dict):
+            identity = profile.setdefault("identity", {})
+            for key, value in identity_override.items():
+                if value not in (None, "", [], {}):
+                    identity[key] = deep_copy(value)
+        note = clean_text(overrides.get("admin_note"))
+        if note:
+            profile["admin_note"] = note
+        return profile
+
+    def _infer_core_motivation(self, profile):
+        character_id = profile.get("character_id")
+        character = self.character_by_id.get(character_id, {})
+        novel_track = (
+            self.world_db.get("canonical_novel_db", {})
+            .get("entity_tracks", {})
+            .get(character_id, {})
+        )
+        existing = deep_copy(
+            profile.get("core_motivation")
+            or character.get("core_motivation")
+            or novel_track.get("core_motivation")
+            or {}
+        )
+        if existing and (
+            existing.get("root_drives")
+            or existing.get("current_objectives")
+            or existing.get("current_true_objectives")
+        ):
+            existing.setdefault(
+                "true_self",
+                existing.get("true_identity_name")
+                or profile.get("canonical_name")
+                or character.get("canonical_name", ""),
+            )
+            existing.setdefault(
+                "true_identity_name",
+                profile.get("canonical_name")
+                or character.get("canonical_name", ""),
+            )
+            if "current_true_objectives" not in existing:
+                existing["current_true_objectives"] = deep_copy(
+                    existing.get("current_objectives", [])
+                )
+            if "current_objectives" not in existing:
+                existing["current_objectives"] = deep_copy(
+                    existing.get("current_true_objectives", [])
+                )
+            if "fears_or_constraints" not in existing:
+                existing["fears_or_constraints"] = deep_copy(
+                    existing.get("fears", [])
+                )
+            if "strategy_identities" not in existing:
+                strategy = deep_copy(existing.get("strategy_patterns", []))
+                for item in (
+                    profile.get("identity_layers", {})
+                    or character.get("identity_layers", {})
+                    or {}
+                ).get("roleplay_identities", []):
+                    if isinstance(item, dict):
+                        strategy.append(
+                            clean_text(item.get("purpose"))
+                            or clean_text(item.get("identity"))
+                        )
+                existing["strategy_identities"] = compact_list(
+                    [item for item in strategy if clean_text(item)],
+                    12,
+                )
+            existing.setdefault(
+                "roleplay_identity_policy",
+                existing.get("identity_policy")
+                or (
+                    profile.get("identity_layers", {})
+                    or character.get("identity_layers", {})
+                    or {}
+                ).get("policy", ""),
+            )
+            existing.setdefault(
+                "action_policy",
+                self._motivation_action_policy(existing),
+            )
+            existing.setdefault("source_basis", [])
+            existing.setdefault("support_notes", existing.get("inference_notes", []))
+            return existing
+        identity = profile.get("identity", {})
+        state = profile.get("state", {})
+        attributes = {
+            **deep_copy(novel_track.get("attributes", {}) or {}),
+            **deep_copy(character.get("attributes", {}) or {}),
+            **deep_copy(profile.get("attributes", {}) or {}),
+        }
+        background_evidence = compact_list(
+            [
+                *state.get("background_evidence", []),
+                *character.get("background", []),
+                *novel_track.get("descriptions", []),
+            ],
+            12,
+        )
+        evidence_texts = []
+        for item in profile.get("evidence_refs", []):
+            evidence_texts.append(item.get("source_text"))
+        for item in character.get("evidence_refs", []):
+            evidence_texts.append(item.get("source_text"))
+        for item in novel_track.get("evidence_refs", []):
+            evidence_texts.append(item.get("source_text"))
+        for item in profile.get("source_evidence_refs", []):
+            evidence_texts.extend(item.get("snippets", []))
+        relation_texts = []
+        for item in profile.get("relationships", []):
+            relation_texts.append(item.get("edge_statement"))
+            for evidence in item.get("evidence", [])[:2]:
+                relation_texts.append(evidence.get("source_text"))
+        source_basis = [
+            clean_text(item)
+            for item in compact_list(
+                [
+                    state.get("background_summary"),
+                    *background_evidence,
+                    *state.get("goals", []),
+                    *state.get("constraints", []),
+                    *state.get("personality", []),
+                    *state.get("knowledge_scope", []),
+                    *evidence_texts,
+                    *relation_texts,
+                ],
+                40,
+            )
+            if clean_text(item)
+        ]
+        basis_text = "；".join(source_basis)
+        lower_basis = basis_text.casefold()
+        canonical_name = profile.get("canonical_name", "")
+        subtypes = compact_list(
+            attributes.get("entity_subtype", [])
+            if isinstance(attributes.get("entity_subtype"), list)
+            else [attributes.get("entity_subtype", "")],
+            8,
+        )
+        true_self_parts = [canonical_name]
+        if subtypes:
+            true_self_parts.append("、".join(subtypes))
+        elif "妖怪" in basis_text or canonical_name.endswith("精"):
+            true_self_parts.append("妖怪")
+        true_self = "（".join(true_self_parts[:2])
+        if len(true_self_parts) > 1:
+            true_self += "）"
+
+        root_drives = compact_list(state.get("goals", []), 8)
+        current_objectives = compact_list(state.get("goals", []), 8)
+        fears_or_constraints = compact_list(state.get("constraints", []), 8)
+        strategies = []
+        support_notes = []
+
+        if "骗取唐僧肉" in basis_text or (
+            "唐僧肉" in basis_text and ("骗" in basis_text or "变身" in basis_text)
+        ):
+            current_objectives.append("通过变身接近唐僧并骗取唐僧肉")
+            root_drives.append("获取唐僧肉以延续生命、增长修为或追求长生")
+            strategies.append("把外在身份当作接近唐僧的临时伪装")
+            support_notes.append("来源写明通过变身骗取唐僧肉；更深层欲望按妖怪行动逻辑推断")
+        elif "唐僧肉" in basis_text:
+            current_objectives.append("围绕唐僧肉寻找机会")
+            root_drives.append("获取唐僧肉带来的生存或修为利益")
+            support_notes.append("来源提到唐僧肉；具体欲望按行动目标推断")
+
+        if "变身" in basis_text or identity.get("forms") or identity.get("temporary_identities"):
+            strategies.append("伪装、变身或临时身份是行动策略，不是本体人格")
+        if "妖怪" in basis_text or "demon" in lower_basis or canonical_name.endswith("精"):
+            root_drives.append("保全妖怪本体，避开能识破或伤害自己的对手")
+        if "火眼金睛" in basis_text and ("识破妖怪" in basis_text or "识破" in basis_text):
+            fears_or_constraints.append("孙悟空的火眼金睛会带来暴露风险")
+        if "紧箍咒" in basis_text and "孙悟空" in basis_text:
+            fears_or_constraints.append("唐僧能用紧箍咒牵制孙悟空，这可能改变风险判断")
+        if "妖怪" in basis_text or "demon" in lower_basis or canonical_name.endswith("精"):
+            fears_or_constraints.append("本体暴露后遭到降伏或诛杀")
+
+        root_drives = compact_list(root_drives, 8)
+        current_objectives = compact_list(current_objectives, 8)
+        strategies = compact_list(strategies, 8)
+        fears_or_constraints = compact_list(fears_or_constraints, 8)
+        support_notes = compact_list(support_notes, 6)
+        if not root_drives:
+            root_drives = ["维持本体生存，并按既有身份、关系和处境追求利益"]
+            support_notes.append("资料未给出显式长期欲望，运行时只做保守动机占位")
+        if not current_objectives:
+            current_objectives = ["延续当前处境中最符合本体利益的目标"]
+        return {
+            "true_self": true_self,
+            "true_identity_name": canonical_name,
+            "root_drives": root_drives,
+            "current_true_objectives": current_objectives,
+            "fears_or_constraints": fears_or_constraints,
+            "strategy_identities": strategies,
+            "roleplay_identity_policy": (
+                "本体、欲望和长期目标优先；任何村姑、老人、商旅、仆从、"
+                "化身或日常身份都只是角色为了达成目的而表演的外层身份。"
+                "叙事可以写伪装的动作，但私下判断必须来自真实本体。"
+            ),
+            "action_policy": self._motivation_action_policy(
+                {
+                    "root_drives": root_drives,
+                    "current_true_objectives": current_objectives,
+                    "fears_or_constraints": fears_or_constraints,
+                    "strategy_identities": strategies,
+                    "temptations": compact_list(
+                        ["唐僧肉"] if "唐僧肉" in basis_text else [],
+                        4,
+                    ),
+                }
+            ),
+            "source_basis": source_basis[:12],
+            "support_notes": support_notes,
+        }
+
+    def current_canonical_event(self):
+        cursor = int(self.store.runtime.get("timeline_cursor", 0) or 0)
+        timeline = self._timeline_nodes()
+        if not timeline:
+            return {}
+        return deep_copy(timeline[min(cursor, len(timeline) - 1)])
+
+    def _current_trigger_analysis(self, profile, core_motivation):
+        anchor = self.current_canonical_event()
+        anchor_text = "；".join(
+            clean_text(item)
+            for item in compact_list(
+                [
+                    anchor.get("event"),
+                    anchor.get("default_outcome"),
+                    *anchor.get("participant_names", []),
+                    *[
+                        item.get("name")
+                        for item in anchor.get("ability_refs", [])
+                    ],
+                    *[
+                        item.get("name")
+                        for item in anchor.get("artifact_refs", [])
+                    ],
+                ],
+                30,
+            )
+            if clean_text(item)
+        )
+        objectives = "；".join(core_motivation.get("current_true_objectives", []))
+        triggers = []
+        if "唐僧" in anchor_text and ("唐僧" in objectives or "唐僧肉" in objectives):
+            triggers.append("看见或确认唐僧会触发接近、诱骗或下手的机会判断")
+        if "孙悟空" in anchor_text or "悟空" in anchor_text:
+            triggers.append("孙悟空在场会触发暴露、被识破和正面冲突风险判断")
+        if "火眼金睛" in anchor_text or "识破妖怪" in anchor_text:
+            triggers.append("火眼金睛相关信息会让伪装策略变得紧迫且危险")
+        if (
+            any(word in anchor_text for word in ("唐僧", "唐僧肉"))
+            and any(word in anchor_text for word in ("孙悟空", "悟空", "火眼金睛"))
+            and ("唐僧" in objectives or "唐僧肉" in objectives)
+        ):
+            triggers.append(
+                "欲望与风险同时存在：恐惧只能迫使其换身份、绕开视线、试探或诱导，不能取消接近唐僧的核心目标"
+            )
+        if not triggers:
+            triggers.append("按本体欲望、当前目标和可见风险决定下一步")
+        return {
+            "current_anchor_text": anchor_text,
+            "triggered_desires_and_judgments": compact_list(triggers, 6),
+        }
+
+    @staticmethod
+    def _core_current_objectives(core_motivation):
+        return (
+            core_motivation.get("current_true_objectives")
+            or core_motivation.get("current_objectives")
+            or []
+        )
+
+    @staticmethod
+    def _core_fears(core_motivation):
+        return (
+            core_motivation.get("fears_or_constraints")
+            or core_motivation.get("fears")
+            or []
+        )
+
+    @staticmethod
+    def _core_strategies(core_motivation):
+        return (
+            core_motivation.get("strategy_identities")
+            or core_motivation.get("strategy_patterns")
+            or []
+        )
+
+    def _motivation_action_policy(self, source):
+        source = source or {}
+        objectives = (
+            source.get("current_objectives")
+            or self._core_current_objectives(source)
+        )
+        fears = source.get("fears") or self._core_fears(source)
+        strategies = source.get("strategies") or self._core_strategies(source)
+        text = "；".join(
+            clean_text(item)
+            for item in [
+                *source.get("root_drives", []),
+                *objectives,
+                *fears,
+                *strategies,
+                *source.get("temptations", []),
+                *source.get("trigger_rules", []),
+            ]
+            if clean_text(item)
+        )
+        pursues_tang = "唐僧" in text or "唐僧肉" in text
+        has_high_threat = any(
+            word in text
+            for word in ("孙悟空", "悟空", "火眼金睛", "识破", "暴露", "降伏", "诛杀")
+        )
+        self_preserving = any(
+            word in text
+            for word in (
+                "保全自身",
+                "保命",
+                "活过",
+                "逃离",
+                "求援",
+                "躲藏",
+                "误导",
+                "拖延",
+                "危险远离",
+            )
+        )
+        uses_disguise = any(
+            word in text
+            for word in ("伪装", "变身", "化身", "临时身份", "骗", "诱")
+        )
+        forward_actions = ["观察", "试探", "换策略", "保留下一步机会"]
+        if uses_disguise:
+            forward_actions.extend(["维护伪装", "变换身份", "制造误判"])
+        if pursues_tang:
+            forward_actions.extend(["接近唐僧", "诱导唐僧", "分散护卫注意"])
+        if has_high_threat:
+            forward_actions.extend(["绕开孙悟空视线", "拉开风险距离", "等待护卫破绽"])
+        if pursues_tang and has_high_threat:
+            action_bias = "risk_managed_pursuit"
+        elif self_preserving:
+            action_bias = "self_preserving_autonomy"
+            forward_actions.extend(["寻找退路", "拖延", "误导", "逃离", "求援", "躲藏"])
+        else:
+            action_bias = "goal_directed_survival"
+        return {
+            "priority": (
+                "根本欲望决定方向；若根本欲望是保命，恐惧本身就是行动方向，"
+                "可以触发逃离、求援、躲藏、拖延或误导。"
+            ),
+            "when_threatened": (
+                "高威胁下先隐蔽推进核心目标：维护伪装、换身份、转移视线、"
+                "分散威胁、试探目标或制造机会；若角色目标是自保，暂避、逃跑、"
+                "求援或给出不完全信息都可以是目标导向行动。"
+            ),
+            "stall_guard": (
+                "除非玩家明确要求或角色被外力限制，不要整轮只屏息、僵住、"
+                "装死、扮石头或反复描写恐惧；停顿之后必须出现目标导向的判断或动作。"
+            ),
+            "action_bias": action_bias,
+            "forward_actions": compact_list(forward_actions, 12),
+            "risk_can_override_goal": bool(self_preserving and not pursues_tang),
+        }
+
+    def _motivation_terms(self, profile):
+        core = profile.get("core_motivation", {}) or {}
+        terms = [
+            profile.get("canonical_name", ""),
+            core.get("true_self", ""),
+            *core.get("root_drives", []),
+            *self._core_current_objectives(core),
+            *self._core_fears(core),
+            *core.get("attachments", []),
+            *core.get("temptations", []),
+            *self._core_strategies(core),
+            *core.get("trigger_rules", []),
+            *core.get("emotional_baseline", []),
+        ]
+        for item in profile.get("identity_layers", {}).get(
+            "roleplay_identities", []
+        ):
+            if isinstance(item, dict):
+                terms.extend([item.get("identity", ""), item.get("purpose", "")])
+        result = []
+        for text in terms:
+            text = clean_text(text)
+            if not text:
+                continue
+            result.append(text.casefold())
+            for sequence in re.findall("[\u4e00-\u9fff]{4,}", text):
+                for size in (2, 3, 4):
+                    for index in range(0, max(0, len(sequence) - size + 1)):
+                        result.append(sequence[index:index + size])
+        return compact_list(result, 48)
+
+    def _root_missing_fields(self, core_motivation):
+        missing = []
+        if not clean_text(core_motivation.get("true_self")):
+            missing.append("true_self")
+        if not core_motivation.get("root_drives"):
+            missing.append("root_drives")
+        if not self._core_current_objectives(core_motivation):
+            missing.append("current_objectives")
+        if not self._core_fears(core_motivation):
+            missing.append("fears")
+        if not self._core_strategies(core_motivation):
+            missing.append("strategy_patterns")
+        if not core_motivation.get("trigger_rules") and not core_motivation.get(
+            "current_trigger_analysis"
+        ):
+            missing.append("trigger_rules")
+        if not core_motivation.get("source_basis"):
+            missing.append("source_basis")
+        return missing
+
+    def _character_root_lookup(self, profile):
+        core = deep_copy(profile.get("core_motivation", {}) or {})
+        if core:
+            core.setdefault(
+                "current_trigger_analysis",
+                self._current_trigger_analysis(profile, core),
+            )
+            trigger_text = clean_text(
+                "；".join(
+                    core.get("current_trigger_analysis", {}).get(
+                        "triggered_desires_and_judgments",
+                        [],
+                    )
+                )
+            )
+            if (
+                any(word in trigger_text for word in ("孙悟空", "悟空", "火眼金睛", "识破"))
+                and not any(
+                    "孙悟空" in clean_text(item) or "火眼金睛" in clean_text(item)
+                    for item in self._core_fears(core)
+                )
+            ):
+                core["fears_or_constraints"] = compact_list(
+                    [
+                        *self._core_fears(core),
+                        "孙悟空或火眼金睛会带来暴露和正面冲突风险",
+                    ],
+                    8,
+                )
+        identity_layers = deep_copy(profile.get("identity_layers", {}) or {})
+        missing = self._root_missing_fields(core)
+        if not missing:
+            coverage = "good"
+        elif len(missing) <= 2:
+            coverage = "partial"
+        else:
+            coverage = "thin"
+        return {
+            "tool": "character_root_lookup",
+            "coverage": coverage,
+            "missing_fields": missing,
+            "true_self": core.get("true_self")
+                or profile.get("canonical_name", ""),
+            "root_drives": deep_copy(core.get("root_drives", []))[:8],
+            "current_objectives": deep_copy(
+                self._core_current_objectives(core)
+            )[:8],
+            "fears": deep_copy(self._core_fears(core))[:8],
+            "attachments": deep_copy(core.get("attachments", []))[:8],
+            "temptations": deep_copy(core.get("temptations", []))[:8],
+            "strategies": deep_copy(self._core_strategies(core))[:8],
+            "trigger_rules": deep_copy(core.get("trigger_rules", []))[:8],
+            "action_policy": deep_copy(
+                core.get("action_policy")
+                or self._motivation_action_policy(core)
+            ),
+            "current_trigger_analysis": deep_copy(
+                core.get("current_trigger_analysis", {})
+            ),
+            "identity_layers": identity_layers,
+            "source_basis": deep_copy(core.get("source_basis", []))[:10],
+            "inference_notes": deep_copy(
+                core.get("inference_notes")
+                or core.get("support_notes", [])
+            )[:6],
+        }
+
+    def _graph_neighborhood_tool(self, profile):
+        threats = []
+        attachments = []
+        opportunities = []
+        relation_rows = []
+        threat_types = {
+            "FIGHTS_WITH", "HAS_CONFLICT_WITH", "OPPOSES", "ENEMY_OF",
+            "OFFENDS", "ORDERS_CAPTURE_OF",
+        }
+        attachment_types = {
+            "PROTECTS", "PARENT_OF", "CHILD_OF", "MASTER_OF",
+            "DISCIPLE_OF", "TRAVELS_WITH", "ACCOMPANIES",
+            "COMPANION_OF", "SWORN_SIBLING_OF",
+        }
+        for relation in profile.get("relationships", [])[:24]:
+            relation_type = clean_text(
+                relation.get("relation_type")
+                or relation.get("current_value")
+                or ",".join(relation.get("current_labels", []))
+            ).upper()
+            name = clean_text(
+                relation.get("name")
+                or ",".join(relation.get("participant_names", []))
+            )
+            row = {
+                "relation_type": relation_type,
+                "name": name,
+                "confidence": relation.get("confidence")
+                    or relation.get("status", ""),
+                "entity_id": relation.get("entity_id"),
+                "evidence": [
+                    clean_text(item.get("source_text"))
+                    for item in relation.get("evidence", [])[:2]
+                    if clean_text(item.get("source_text"))
+                ],
+            }
+            relation_rows.append(row)
+            if relation_type in threat_types:
+                threats.append(row)
+            elif relation_type in attachment_types:
+                attachments.append(row)
+            elif relation_type in {"USES_ABILITY", "OWNS_ARTIFACT", "USES_ARTIFACT"}:
+                opportunities.append(row)
+        capabilities = []
+        for group_name in ("abilities", "owned_items", "used_items"):
+            for item in profile.get("capabilities", {}).get(group_name, []):
+                capabilities.append({
+                    "kind": group_name,
+                    "entity_id": item.get("entity_id"),
+                    "name": item.get("name")
+                        or item.get("canonical_name")
+                        or item.get("surface_name"),
+                })
+        scene = self.store.runtime.get("active_scene") or {}
+        nearby = [
+            {
+                "character_id": character_id,
+                "name": self.character_by_id.get(character_id, {}).get(
+                    "canonical_name", character_id
+                ),
+            }
+            for character_id in scene.get("participant_ids", [])
+            if character_id != profile.get("character_id")
+        ]
+        return {
+            "tool": "graph_neighborhood_tool",
+            "relationships": relation_rows[:12],
+            "threats": threats[:6],
+            "attachments": attachments[:6],
+            "opportunities": opportunities[:6],
+            "capabilities": capabilities[:12],
+            "nearby_characters": nearby[:12],
+        }
+
+    def _motivation_evidence_retriever(
+        self,
+        profile,
+        terms,
+        global_retrieval,
+        limit=10,
+    ):
+        root_terms = self._motivation_terms(profile)
+        effective_terms = compact_list(
+            [*terms, *root_terms],
+            80,
+        )
+        candidates = []
+        seen = set()
+
+        def add(score, record):
+            text = clean_text(record.get("source_text"))
+            if not text:
+                return
+            marker = (
+                record.get("source"),
+                record.get("source_chunk_id"),
+                text,
+                record.get("timeline_id"),
+            )
+            if marker in seen:
+                return
+            seen.add(marker)
+            row = deep_copy(record)
+            row["source_text"] = text
+            row["score"] = round(score, 3)
+            candidates.append(row)
+
+        for text in [
+            *profile.get("core_motivation", {}).get("source_basis", []),
+            *profile.get("state", {}).get("background_evidence", []),
+        ]:
+            text = clean_text(text)
+            if not text:
+                continue
+            haystack = text.casefold()
+            score, matched = self._term_score(haystack, effective_terms)
+            add(
+                score + 6,
+                {
+                    "source": "core_motivation_source_basis",
+                    "source_chunk_id": "",
+                    "source_text": text,
+                    "tags": [
+                        profile.get("canonical_name", ""),
+                        "core_motivation",
+                    ],
+                    "character_id": profile.get("character_id"),
+                    "character_name": profile.get("canonical_name"),
+                    "matched_terms": matched,
+                },
+            )
+
+        for record in global_retrieval.get("source_snippets", []):
+            if record.get("character_id") not in {
+                profile.get("character_id"), "", None,
+            }:
+                continue
+            haystack = " ".join([
+                record.get("source_text", ""),
+                *record.get("tags", []),
+            ]).casefold()
+            score, matched = self._term_score(haystack, effective_terms)
+            if score:
+                row = deep_copy(record)
+                row["matched_terms"] = compact_list(
+                    [*row.get("matched_terms", []), *matched],
+                    16,
+                )
+                add(score + row.get("weight", 1), row)
+
+        for record in self._profile_source_snippets(profile):
+            haystack = " ".join([
+                record.get("source_text", ""),
+                record.get("character_name", ""),
+                *record.get("tags", []),
+            ]).casefold()
+            score, matched = self._term_score(haystack, effective_terms)
+            if not score and record.get("source") not in {
+                "relationship_evidence", "event_ref",
+            }:
+                continue
+            row = deep_copy(record)
+            row["matched_terms"] = matched
+            add(score + row.get("weight", 1), row)
+
+        for unit in self._search_knowledge_units(effective_terms, limit=12):
+            text = "；".join(
+                clean_text(item)
+                for item in [
+                    unit.get("name", ""),
+                    *unit.get("descriptions", [])[:3],
+                ]
+                if clean_text(item)
+            )
+            if not text:
+                continue
+            add(
+                float(unit.get("_retrieval_score", 1)),
+                {
+                    "source": "knowledge_unit",
+                    "source_chunk_id": ",".join(
+                        str(item) for item in unit.get("source_chunk_ids", [])
+                    ),
+                    "source_text": text,
+                    "tags": unit.get("retrieval_tags", []),
+                    "character_id": "",
+                    "character_name": "",
+                    "matched_terms": unit.get("_matched_terms", []),
+                    "knowledge_id": unit.get("knowledge_id"),
+                    "entity_id": unit.get("entity_id"),
+                    "model_status": unit.get("model_status"),
+                },
+            )
+
+        anchor = self.current_canonical_event()
+        anchor_text = clean_text(anchor.get("default_outcome"))
+        if anchor_text:
+            haystack = " ".join([
+                anchor_text,
+                anchor.get("event", ""),
+                *anchor.get("participant_names", []),
+            ]).casefold()
+            score, matched = self._term_score(haystack, effective_terms)
+            participant_overlap = profile.get("character_id") in anchor.get(
+                "participants", []
+            )
+            if score or participant_overlap:
+                add(
+                    score + (4 if participant_overlap else 0),
+                    {
+                        "source": "current_canonical_anchor",
+                        "timeline_id": anchor.get("timeline_id"),
+                        "source_chunk_id": str(
+                            (anchor.get("source_chunk_ids") or [""])[0]
+                        ),
+                        "source_text": anchor_text,
+                        "tags": [
+                            anchor.get("event", ""),
+                            *anchor.get("participant_names", []),
+                        ],
+                        "character_id": "",
+                        "character_name": "",
+                        "matched_terms": matched,
+                    },
+                )
+
+        candidates.sort(key=lambda item: (-item.get("score", 0), item.get("source", "")))
+        snippets = candidates[:limit]
+        return {
+            "tool": "motivation_evidence_retriever",
+            "query_terms": sorted(effective_terms)[:48],
+            "root_terms": root_terms[:32],
+            "evidence_snippets": snippets,
+            "evidence_count": len(snippets),
+            "policy": (
+                "这些证据用于补足角色本体、欲望、恐惧、策略和当前触发判断；"
+                "证据不足时只能保守推断并标注不确定。"
+            ),
+        }
+
+    def _retrieval_quality_gate(self, root_lookup, motivation_evidence):
+        missing = root_lookup.get("missing_fields", [])
+        evidence_count = int(motivation_evidence.get("evidence_count", 0) or 0)
+        if not missing and evidence_count >= 2:
+            status = "strong"
+        elif len(missing) <= 2 and evidence_count >= 1:
+            status = "usable"
+        else:
+            status = "thin"
+        actions = []
+        if "true_self" in missing or "root_drives" in missing:
+            actions.append("扩大角色原文证据和关系邻域检索")
+        if "current_objectives" in missing or "trigger_rules" in missing:
+            actions.append("检查当前 timeline anchor 与角色目标是否相交")
+        if evidence_count == 0:
+            actions.append("不要让模型自由补设定，只能按保守生存/利益动机行动")
+        if not actions:
+            actions.append("可直接用于本轮 agent 决策")
+        return {
+            "tool": "retrieval_quality_gate",
+            "status": status,
+            "missing_fields": missing,
+            "evidence_count": evidence_count,
+            "recommended_actions": actions,
+            "decision_policy": (
+                "strong/usable 可驱动行动；thin 时必须降低自信，优先观察、试探、"
+                "保守行动或请求更多证据。"
+            ),
+        }
+
+    @staticmethod
+    def _intensity_shift(current, delta):
+        return bounded_int(
+            int(current or 0) + int(delta or 0),
+            default=0,
+            minimum=0,
+            maximum=100,
+        )
+
+    def _baseline_motivation_runtime(self, profile, root_lookup=None):
+        root_lookup = root_lookup or self._character_root_lookup(profile)
+        root_text = "；".join(
+            clean_text(item)
+            for item in [
+                *root_lookup.get("root_drives", []),
+                *root_lookup.get("current_objectives", []),
+                *root_lookup.get("fears", []),
+                *root_lookup.get("strategies", []),
+                *root_lookup.get("temptations", []),
+            ]
+            if clean_text(item)
+        )
+        pursues_tang = "唐僧" in root_text or "唐僧肉" in root_text
+        has_fears = bool(root_lookup.get("fears"))
+        has_disguise = any(
+            "伪装" in clean_text(item) or "变身" in clean_text(item)
+            for item in root_lookup.get("strategies", [])
+        )
+        action_policy = root_lookup.get("action_policy") or self._motivation_action_policy(
+            root_lookup
+        )
+        return {
+            "character_id": profile.get("character_id"),
+            "dominant_drive": clean_text(
+                (root_lookup.get("root_drives") or [""])[0]
+            ),
+            "active_objective": clean_text(
+                (root_lookup.get("current_objectives") or [""])[0]
+            ),
+            "active_fear": clean_text(
+                (root_lookup.get("fears") or [""])[0]
+            ),
+            "current_strategy": clean_text(
+                (root_lookup.get("strategies") or [""])[0]
+            ),
+            "desire_intensity": (
+                55 if pursues_tang else 35 if root_lookup.get("root_drives") else 10
+            ),
+            "fear_intensity": (
+                35 if pursues_tang and has_fears else 25 if has_fears else 5
+            ),
+            "attachment_focus": clean_text(
+                (root_lookup.get("attachments") or [""])[0]
+            ),
+            "temptation_focus": clean_text(
+                (root_lookup.get("temptations") or [""])[0]
+            ),
+            "disguise_pressure": (
+                55 if pursues_tang and has_disguise else 35 if has_disguise
+                else 0
+            ),
+            "action_policy": deep_copy(action_policy),
+            "confidence": root_lookup.get("coverage", "unknown"),
+            "last_trigger": "",
+            "last_updated_by_event_id": None,
+            "history": [],
+        }
+
+    def _motivation_delta_for_actor(
+        self,
+        profile,
+        actor_action,
+        resolution,
+        actor_packet=None,
+    ):
+        actor_packet = actor_packet or {}
+        root_lookup = (
+            actor_packet.get("internal_tools", {}).get("character_root_lookup")
+            or self._character_root_lookup(profile)
+        )
+        quality = actor_packet.get("internal_tools", {}).get(
+            "retrieval_quality_gate", {}
+        )
+        current = self.store.runtime.get("motivation_runtime", {}).get(
+            profile["character_id"],
+            {},
+        )
+        if not current:
+            current = self._baseline_motivation_runtime(profile, root_lookup)
+        text = clean_text(
+            "；".join(
+                [
+                    actor_action.get("resolved_intent", ""),
+                    actor_action.get("visible_behavior", ""),
+                    actor_action.get("goal", ""),
+                    actor_action.get("emotion", ""),
+                    actor_action.get("dialogue", ""),
+                    actor_action.get("action_intent", {}).get("description", ""),
+                    resolution.get("outcome", ""),
+                    resolution.get("divergence_reason", ""),
+                    *[
+                        clean_text(item)
+                        for item in resolution.get("consequences", [])
+                    ],
+                ]
+            )
+        )
+        desire_delta = 0
+        fear_delta = 0
+        disguise_delta = 0
+        trigger_notes = []
+
+        for objective in root_lookup.get("current_objectives", []):
+            objective = clean_text(objective)
+            if objective and any(term in text for term in re.findall("[\u4e00-\u9fff]{2,4}", objective)):
+                desire_delta += 8
+                trigger_notes.append("本轮行动触及当前目的")
+                break
+        for drive in root_lookup.get("root_drives", []):
+            drive = clean_text(drive)
+            if drive and any(term in text for term in re.findall("[\u4e00-\u9fff]{2,4}", drive)):
+                desire_delta += 5
+                break
+        for fear in root_lookup.get("fears", []):
+            fear = clean_text(fear)
+            if fear and any(term in text for term in re.findall("[\u4e00-\u9fff]{2,4}", fear)):
+                fear_delta += 10
+                trigger_notes.append("本轮行动触及恐惧")
+                break
+        if any(word in text for word in ("暴露", "识破", "火眼金睛", "危险", "冲突")):
+            fear_delta += 12
+            disguise_delta += 8
+            trigger_notes.append("暴露或冲突风险上升")
+        if any(word in text for word in ("伪装", "变身", "骗", "隐瞒", "试探")):
+            disguise_delta += 10
+            trigger_notes.append("伪装策略被激活")
+        if any(word in text for word in ("成功", "接近", "得手", "机会")):
+            desire_delta += 8
+        if any(word in text for word in ("失败", "阻止", "受伤", "惩罚", "逃")):
+            fear_delta += 8
+            desire_delta -= 3
+        if resolution.get("outcome") == "success":
+            desire_delta += 4
+        elif resolution.get("outcome") in {"failed", "partial"}:
+            fear_delta += 4
+        if quality.get("status") == "thin":
+            fear_delta += 3
+            trigger_notes.append("证据质量薄，行动自信降低")
+
+        trigger_analysis = root_lookup.get("current_trigger_analysis", {})
+        trigger_text = clean_text(
+            "；".join(trigger_analysis.get("triggered_desires_and_judgments", []))
+        )
+        if trigger_text:
+            trigger_notes.append(trigger_text)
+            if any(word in trigger_text for word in ("接近", "诱骗", "捕获", "下手", "机会")):
+                desire_delta += 10
+            if any(word in trigger_text for word in ("伪装", "换身份", "绕开", "试探", "诱导")):
+                disguise_delta += 8
+            if any(word in trigger_text for word in ("风险", "暴露", "识破", "火眼金睛")):
+                fear_delta += 6
+
+        action_policy = root_lookup.get("action_policy") or self._motivation_action_policy(
+            root_lookup
+        )
+        if action_policy.get("action_bias") == "risk_managed_pursuit":
+            desire_delta += 4
+            disguise_delta += 4
+
+        dominant_drive = clean_text(
+            current.get("dominant_drive")
+            or (root_lookup.get("root_drives") or [""])[0]
+        )
+        active_objective = clean_text(
+            actor_action.get("goal")
+            or current.get("active_objective")
+            or (root_lookup.get("current_objectives") or [""])[0]
+        )
+        active_fear = clean_text(
+            current.get("active_fear")
+            or (root_lookup.get("fears") or [""])[0]
+        )
+        current_strategy = clean_text(
+            current.get("current_strategy")
+            or (root_lookup.get("strategies") or [""])[0]
+        )
+        if any(word in text for word in ("伪装", "变身", "骗", "试探")):
+            strategy_candidates = [
+                item for item in root_lookup.get("strategies", [])
+                if any(word in clean_text(item) for word in ("伪装", "变身", "骗", "试探"))
+            ]
+            current_strategy = clean_text(
+                (strategy_candidates or [current_strategy])[0]
+            )
+        if (
+            action_policy.get("action_bias") == "risk_managed_pursuit"
+            and not current_strategy
+        ):
+            current_strategy = "在高风险下隐蔽推进核心目标"
+        next_desire_intensity = self._intensity_shift(
+            current.get("desire_intensity"), desire_delta
+        )
+        next_fear_intensity = self._intensity_shift(
+            current.get("fear_intensity"), fear_delta
+        )
+        if action_policy.get("action_bias") == "risk_managed_pursuit":
+            next_desire_intensity = max(next_desire_intensity, 50)
+        history_entry = {
+            "revision": self.store.branch.get("head_revision", 0) + 1,
+            "event_id": "",
+            "desire_delta": desire_delta,
+            "fear_delta": fear_delta,
+            "disguise_delta": disguise_delta,
+            "trigger": clean_text("；".join(trigger_notes))[:240],
+            "action": clean_text(
+                actor_action.get("resolved_intent")
+                or actor_action.get("visible_behavior")
+                or actor_action.get("action_intent", {}).get("description")
+            )[:240],
+        }
+        return {
+            "character_id": profile["character_id"],
+            "dominant_drive": dominant_drive,
+            "active_objective": active_objective,
+            "active_fear": active_fear,
+            "current_strategy": current_strategy,
+            "desire_intensity": next_desire_intensity,
+            "fear_intensity": next_fear_intensity,
+            "attachment_focus": clean_text(
+                current.get("attachment_focus")
+                or (root_lookup.get("attachments") or [""])[0]
+            ),
+            "temptation_focus": clean_text(
+                current.get("temptation_focus")
+                or (root_lookup.get("temptations") or [""])[0]
+            ),
+            "disguise_pressure": self._intensity_shift(
+                current.get("disguise_pressure"), disguise_delta
+            ),
+            "action_policy": deep_copy(action_policy),
+            "confidence": quality.get("status")
+                or root_lookup.get("coverage")
+                or current.get("confidence", "unknown"),
+            "last_trigger": history_entry["trigger"],
+            "last_updated_by_event_id": "",
+            "history": [
+                *deep_copy(current.get("history", [])),
+                history_entry,
+            ][-12:],
+        }
 
     def _dynamic_profile(self, character_id):
         if character_id in self.agent_by_character_id:
             return self._profile_with_current_capabilities(
                 self.agent_by_character_id[character_id]
+            )
+        runtime_profile = self._runtime_npc_profiles().get(character_id)
+        if runtime_profile:
+            runtime_profile = self._runtime_npc_profile_with_autonomy(
+                runtime_profile
+            )
+            return self._profile_with_admin_overrides(
+                self._profile_with_current_capabilities(runtime_profile)
             )
         character = self.character_by_id[character_id]
         evidence = [
@@ -2000,14 +3450,18 @@ class SimulationOrchestrator:
                     *character.get("aliases", []),
                 ],
             },
+            "identity_layers": deep_copy(character.get("identity_layers", {})),
+            "core_motivation": deep_copy(character.get("core_motivation", {})),
             "state": {
                 "background_summary": character.get("background_summary", ""),
+                "background_evidence": character.get("background", [])[:8],
                 "personality": character.get("personality", []),
                 "goals": character.get("goals", []),
                 "constraints": character.get("constraints", []),
                 "speech_styles": character.get("speech_styles", []),
                 "knowledge_scope": character.get("knowledge_scope", []),
             },
+            "attributes": character.get("attributes", {}),
             "capabilities": {
                 "abilities": character.get("abilities", []),
                 "owned_items": character.get("owned_items", []),
@@ -2027,7 +3481,9 @@ class SimulationOrchestrator:
                 "dynamic_reference_agent": True,
             },
         }
-        return self._profile_with_current_capabilities(profile)
+        return self._profile_with_admin_overrides(
+            self._profile_with_current_capabilities(profile)
+        )
 
     def agent_catalog(self):
         rows = []
@@ -2054,6 +3510,25 @@ class SimulationOrchestrator:
                     "prebuilt": character["character_id"] in full_ids,
                     "simulation_status": character.get(
                         "simulation_status", "minor"
+                    ),
+                }
+            )
+        for character_id, profile in self._runtime_npc_profiles().items():
+            rows.append(
+                {
+                    "character_id": character_id,
+                    "canonical_name": profile.get("canonical_name", character_id),
+                    "aliases": profile.get("identity", {}).get("aliases", []),
+                    "tier": profile.get("profile_tier", "runtime"),
+                    "runtime_mode": profile.get(
+                        "runtime_mode",
+                        "runtime_ambient_promoted_agent",
+                    ),
+                    "notice": "运行时 NPC：由持续互动的普通人物临时升级而来。",
+                    "prebuilt": False,
+                    "simulation_status": profile.get(
+                        "simulation_status",
+                        "local_runtime_npc",
                     ),
                 }
             )
@@ -2159,7 +3634,14 @@ class SimulationOrchestrator:
                 )
         return records
 
-    def _runtime_retrieval_packet(self, user_input, profiles, terms, limit=3):
+    def _runtime_retrieval_packet(
+        self,
+        user_input,
+        profiles,
+        terms,
+        limit=3,
+        scene_override=None,
+    ):
         candidates = []
         seen = set()
 
@@ -2206,7 +3688,7 @@ class SimulationOrchestrator:
                 record = deep_copy(record)
                 record["matched_terms"] = compact_list(matched_terms, 12)
                 add_candidate(score, record)
-        scene = self.store.runtime.get("active_scene") or {}
+        scene = scene_override or self.store.runtime.get("active_scene") or {}
         cursor = int(self.store.runtime.get("timeline_cursor", 0) or 0)
         timeline = self._timeline_nodes()
         for index, beat in enumerate(timeline):
@@ -2386,6 +3868,12 @@ class SimulationOrchestrator:
                     "previous_visible_narrative",
                 ],
             },
+            "internal_agent_tools": [
+                "character_root_lookup",
+                "motivation_evidence_retriever",
+                "graph_neighborhood_tool",
+                "retrieval_quality_gate",
+            ],
             "security_policy": {
                 "actor_packets_are_epistemically_filtered": True,
                 "future_anchors_are_system_only": True,
@@ -2488,6 +3976,40 @@ class SimulationOrchestrator:
             if item.get("character_id") in {character_id, None, ""}
         ][:5]
         relationships = profile.get("relationships", [])[:16]
+        core_motivation = deep_copy(profile.get("core_motivation", {}))
+        if core_motivation:
+            core_motivation["current_trigger_analysis"] = (
+                self._current_trigger_analysis(profile, core_motivation)
+            )
+        root_lookup = self._character_root_lookup(profile)
+        graph_neighborhood = self._graph_neighborhood_tool(profile)
+        motivation_evidence = self._motivation_evidence_retriever(
+            profile,
+            terms,
+            global_retrieval,
+            limit=10 if access_tier == "active_focus" else 7,
+        )
+        quality_gate = self._retrieval_quality_gate(
+            root_lookup,
+            motivation_evidence,
+        )
+        merged_snippets = []
+        seen_snippets = set()
+        for item in [
+            *snippets,
+            *motivation_evidence.get("evidence_snippets", []),
+        ]:
+            marker = (
+                item.get("source"),
+                item.get("source_chunk_id"),
+                clean_text(item.get("source_text")),
+            )
+            if marker in seen_snippets:
+                continue
+            seen_snippets.add(marker)
+            merged_snippets.append(item)
+            if len(merged_snippets) >= 8:
+                break
         packet = {
             "schema_version": STEP17_SCHEMA_VERSION,
             "layer": "Runtime Agent Knowledge DB",
@@ -2498,8 +4020,14 @@ class SimulationOrchestrator:
             "query": clean_text(user_input),
             "query_terms": sorted(terms)[:48],
             "identity": deep_copy(profile.get("identity", {})),
+            "core_motivation": core_motivation,
             "current_runtime_state": deep_copy(
                 self.store.runtime.get("character_runtime", {}).get(
+                    character_id, {}
+                )
+            ),
+            "motivation_runtime": deep_copy(
+                self.store.runtime.get("motivation_runtime", {}).get(
                     character_id, {}
                 )
             ),
@@ -2507,7 +4035,13 @@ class SimulationOrchestrator:
             "relationships": deep_copy(relationships),
             "trusted_knowledge": trusted,
             "supported_knowledge": supported,
-            "source_snippets": deep_copy(snippets),
+            "source_snippets": deep_copy(merged_snippets),
+            "internal_tools": {
+                "character_root_lookup": root_lookup,
+                "motivation_evidence_retriever": motivation_evidence,
+                "graph_neighborhood_tool": graph_neighborhood,
+                "retrieval_quality_gate": quality_gate,
+            },
             "recent_visible_events": self._visible_recent_events_for_actor(
                 character_id
             ),
@@ -2603,7 +4137,7 @@ class SimulationOrchestrator:
         index = max(0, min(int(index or 0), len(timeline) - 1))
         return deep_copy(timeline[index])
 
-    def _story_spine_context(self):
+    def _story_spine_context(self, scene_override=None):
         timeline = self._timeline_nodes()
         cursor = int(self.store.runtime.get("timeline_cursor", 0) or 0)
         total = len(timeline)
@@ -2618,7 +4152,7 @@ class SimulationOrchestrator:
                 start=max(0, cursor - 2),
             )
         ]
-        scene = self.store.runtime.get("active_scene") or {}
+        scene = scene_override or self.store.runtime.get("active_scene") or {}
         return {
             "timeline_cursor": cursor,
             "timeline_event_count": total,
@@ -2665,29 +4199,23 @@ class SimulationOrchestrator:
             },
         }
 
-    def build_context_packet(self, user_input, profiles):
-        scene = self.store.runtime.get("active_scene") or {}
+    def build_context_packet(self, user_input, profiles, scene_override=None):
+        scene = scene_override or self.store.runtime.get("active_scene") or {}
         terms = self._search_terms(user_input, profiles, scene)
+        expanded_terms = set(terms)
+        for profile in profiles:
+            expanded_terms.update(self._motivation_terms(profile))
+        terms = {
+            item for item in expanded_terms
+            if clean_text(item)
+        }
         query_plan = self._rag_query_plan(user_input, profiles, terms)
-        scored = []
-        for unit in self.world_db.get("knowledge_units", []):
-            status = unit.get("model_status", "unresolved")
-            if status not in {"trusted", "supported"}:
-                continue
-            haystack = " ".join(
-                [
-                    unit.get("name", ""),
-                    *unit.get("retrieval_tags", []),
-                    *unit.get("descriptions", []),
-                ]
-            ).casefold()
-            score = sum(term in haystack for term in terms)
-            if score:
-                scored.append((score, status == "trusted", unit))
-        scored.sort(key=lambda row: (-row[0], not row[1], row[2]["name"]))
-        units = [deep_copy(row[2]) for row in scored[: self.max_context_units]]
+        units = self._search_knowledge_units(
+            terms,
+            limit=self.max_context_units,
+        )
         global_retrieval = self._runtime_retrieval_packet(
-            user_input, profiles, terms, limit=6
+            user_input, profiles, terms, limit=8, scene_override=scene
         )
         access_by_character_id = {
             item["character_id"]: item.get("runtime_access_tier", "cold_reference")
@@ -2728,7 +4256,7 @@ class SimulationOrchestrator:
                     "cold_npcs_receive_sidecar_when_active": True,
                 },
             },
-            "story_spine": self._story_spine_context(),
+            "story_spine": self._story_spine_context(scene_override=scene),
             "trusted_knowledge": [
                 item for item in units if item.get("model_status") == "trusted"
             ],
@@ -2777,6 +4305,8 @@ class SimulationOrchestrator:
                 "canonical_name": profile["canonical_name"],
                 "profile_tier": profile["profile_tier"],
                 "identity": profile.get("identity", {}),
+                "identity_layers": profile.get("identity_layers", {}),
+                "core_motivation": profile.get("core_motivation", {}),
                 "state": profile.get("state", {}),
                 "capabilities": profile.get("capabilities", {}),
                 "relationships": profile.get("relationships", [])[:12],
@@ -2839,12 +4369,21 @@ class SimulationOrchestrator:
         return system, user
 
     def _call_json(self, system, user, max_tokens=2200):
-        raw = self.call_llm(
-            system,
-            user,
-            temperature=0.2,
-            max_tokens=max_tokens,
-        )
+        try:
+            raw = self.call_llm(
+                system,
+                user,
+                temperature=0.2,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+        except TypeError:
+            raw = self.call_llm(
+                system,
+                user,
+                temperature=0.2,
+                max_tokens=max_tokens,
+            )
         return extract_json_object(raw)
 
     def _normalize_proposal(self, profile, payload):
@@ -3150,29 +4689,27 @@ Validator 内部错误。根据角色意图、已通过或待裁定的检查、�
                 for item in self.store.branch["events"]
                 if item["event_id"] in event_ids
             ][-8:]
-            system = """
-把角色可见的近期事件压缩成短期记忆摘要。只写该角色知道的内容，
-保留关键人物、物品、地点、承诺和未解决冲突。不得补充外部常识。
-只输出 JSON：{"summary":"..."}。
-""".strip()
-            try:
-                payload = self._call_json(
-                    system,
-                    json.dumps(
-                        {
-                            "character": profile["canonical_name"],
-                            "previous_summary": memory.get("summary", ""),
-                            "visible_events": events,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    max_tokens=700,
-                )
-                self.store.update_memory_summary(
-                    character_id, payload.get("summary", "")
-                )
-            except Exception:
+            if not events:
                 continue
+            fragments = []
+            previous = clean_text(memory.get("summary", ""))
+            if previous:
+                fragments.append(previous[-500:])
+            for event in events[-4:]:
+                narration = clean_text(event.get("narration", ""))
+                dialogue = "；".join(
+                    clean_text(line.get("text"))
+                    for line in event.get("dialogue", [])
+                    if clean_text(line.get("text"))
+                )
+                row = "；".join(
+                    item for item in [narration[:220], dialogue[:160]]
+                    if item
+                )
+                if row:
+                    fragments.append(row)
+            summary = clean_text(" / ".join(fragments))[-900:]
+            self.store.update_memory_summary(character_id, summary)
 
     def _nearby_state_description(self):
         scene = self.store.runtime.get("active_scene") or {}
@@ -3227,13 +4764,217 @@ Validator 内部错误。根据角色意图、已通过或待裁定的检查、�
             ),
         }
 
+    def world_admin_snapshot(self, character_limit=40):
+        scene = self.store.runtime.get("active_scene") or {}
+        focus_id = scene.get("focus_character_id")
+        characters = []
+        for character in self.character_db.get("characters", [])[:character_limit]:
+            character_id = character["character_id"]
+            runtime_state = self.store.runtime.get("character_runtime", {}).get(
+                character_id,
+                {},
+            )
+            motivation = self.store.runtime.get("motivation_runtime", {}).get(
+                character_id,
+                {},
+            )
+            overrides = self.store.runtime.get("admin_profile_overrides", {}).get(
+                character_id,
+                {},
+            )
+            if (
+                character_id == focus_id
+                or character_id in scene.get("participant_ids", [])
+                or runtime_state.get("current_activity")
+                or motivation.get("dominant_drive")
+                or overrides
+            ):
+                characters.append(
+                    {
+                        "character_id": character_id,
+                        "canonical_name": character.get("canonical_name"),
+                        "runtime": runtime_state,
+                        "motivation_runtime": motivation,
+                        "admin_profile_overrides": overrides,
+                    }
+                )
+        if not characters:
+            for character in self.character_db.get("characters", [])[:12]:
+                characters.append(
+                    {
+                        "character_id": character["character_id"],
+                        "canonical_name": character.get("canonical_name"),
+                        "runtime": self.store.runtime.get(
+                            "character_runtime",
+                            {},
+                        ).get(character["character_id"], {}),
+                        "motivation_runtime": self.store.runtime.get(
+                            "motivation_runtime",
+                            {},
+                        ).get(character["character_id"], {}),
+                        "admin_profile_overrides": self.store.runtime.get(
+                            "admin_profile_overrides",
+                            {},
+                        ).get(character["character_id"], {}),
+                    }
+                )
+        recent_events = [
+            {
+                "event_id": event.get("event_id"),
+                "event_type": event.get("event_type"),
+                "player_input": event.get("player_input", ""),
+                "narration": clean_text(event.get("narration", ""))[:700],
+                "elapsed_minutes": event.get("elapsed_minutes", 0),
+                "backend_stage": event.get("backend_stage", ""),
+            }
+            for event in self.store.branch.get("events", [])[-8:]
+        ]
+        return {
+            "active_scene": scene,
+            "focus_character_id": focus_id,
+            "nearby_state": self._nearby_state_description(),
+            "story_spine": self._story_spine_context(),
+            "current_canonical_event": self.current_canonical_event(),
+            "recent_events": recent_events,
+            "characters": characters,
+            "admin_profile_overrides": deep_copy(
+                self.store.runtime.get("admin_profile_overrides", {})
+            ),
+            "world_admin_log": deep_copy(
+                self.store.runtime.get("world_admin_log", [])[-20:]
+            ),
+        }
+
+    def world_admin_chat(self, message, apply_changes=True):
+        message = clean_text(message)
+        if not message:
+            raise ValueError("World admin message is empty.")
+        snapshot = self.world_admin_snapshot()
+        system = """
+你是 World Admin Console，不是任何角色。你拥有上帝视角，可以帮助用户查询
+当前剧情、解释 runtime 状态、定位角色、查看动机，也可以按用户要求修改
+运行时角色特征。不要假装成玩家控制角色，不要用第一人称角色视角回答。
+修改必须显式写入 JSON 字段；没有明确要求修改时只回答，不要更改世界。
+
+可修改字段：
+1. admin_profile_overrides: character_id -> {personality/goals/constraints/state/core_motivation/admin_note}
+2. character_runtime_updates: character_id -> 当前活动、姿态、心情、短期目标等运行时状态
+3. motivation_runtime_updates: character_id -> dominant_drive、active_objective、active_fear、current_strategy 等动态动机
+
+只输出 JSON。
+""".strip()
+        user = json.dumps(
+            {
+                "admin_message": message,
+                "snapshot": snapshot,
+                "output_schema": {
+                    "reply": "给用户看的管理员回复",
+                    "plot_summary": "当前剧情摘要",
+                    "admin_profile_overrides": {},
+                    "character_runtime_updates": {},
+                    "motivation_runtime_updates": {},
+                    "notes": [],
+                },
+            },
+            ensure_ascii=False,
+        )
+        payload = self._call_json(system, user, max_tokens=2200)
+        if not isinstance(payload, dict):
+            payload = {"reply": str(payload)}
+        runtime_updates = {}
+        for source_key, runtime_key in (
+            ("admin_profile_overrides", "admin_profile_overrides"),
+            ("character_runtime_updates", "character_runtime"),
+            ("motivation_runtime_updates", "motivation_runtime"),
+        ):
+            value = payload.get(source_key, {})
+            if isinstance(value, dict) and value:
+                runtime_updates[runtime_key] = deep_copy(value)
+        has_admin_changes = bool(runtime_updates)
+        if has_admin_changes:
+            log_entry = {
+                "created_at": utc_now(),
+                "message": message,
+                "reply": clean_text(payload.get("reply")),
+                "changed": True,
+            }
+            runtime_updates["world_admin_log"] = [
+                *deep_copy(self.store.runtime.get("world_admin_log", [])),
+                log_entry,
+            ][-100:]
+        commit = None
+        if apply_changes and has_admin_changes:
+            event_id = "event_" + uuid.uuid4().hex[:16]
+            event = {
+                "event_id": event_id,
+                "idempotency_key": stable_hash(
+                    {
+                        "event_id": event_id,
+                        "branch": self.store.branch["branch_id"],
+                        "revision": self.store.branch["head_revision"],
+                        "admin_message": message,
+                    }
+                ),
+                "event_type": "world_admin_intervention",
+                "impact_level": (
+                    "state_change"
+                    if any(
+                        key in runtime_updates
+                        for key in (
+                            "admin_profile_overrides",
+                            "character_runtime",
+                            "motivation_runtime",
+                        )
+                    )
+                    else "dialogue"
+                ),
+                "status": "completed",
+                "participants": [],
+                "visible_to": [],
+                "narration": clean_text(payload.get("plot_summary")),
+                "dialogue": [],
+                "action_intents": [],
+                "resolved_actions": [],
+                "state_changes": [],
+                "runtime_updates": runtime_updates,
+                "elapsed_minutes": 0,
+                "duration_reason": "world admin console",
+                "clock_transition": self.store.clock_after_minutes(0),
+                "backend_stage": "world_admin_console",
+                "created_at": utc_now(),
+            }
+            validation = {
+                "validation_id": "validation_" + uuid.uuid4().hex[:16],
+                "status": "allowed",
+                "commit_allowed": True,
+                "checks": [
+                    {
+                        "category": "world_admin",
+                        "outcome": "allowed",
+                        "internal_reason": "Admin console changes are explicit user-authorized runtime overrides.",
+                        "evidence_refs": [],
+                    }
+                ],
+                "correction_action": "commit_event",
+                "user_visible_reason": "",
+            }
+            commit = self.store.commit_event(event, validation)
+        return {
+            "reply": clean_text(payload.get("reply")),
+            "plot_summary": clean_text(payload.get("plot_summary")),
+            "notes": payload.get("notes", []),
+            "applied": bool(commit),
+            "commit": commit,
+            "snapshot_after": self.world_admin_snapshot(),
+        }
+
     def create_manual_save(self, progress_callback=None):
         scene = self.store.runtime.get("active_scene") or {}
         participant_ids = scene.get("participant_ids", [])
         profiles = [
             self._dynamic_profile(character_id)
             for character_id in participant_ids
-            if character_id in self.character_by_id
+            if self._is_known_character_id(character_id)
         ]
         self._progress(
             progress_callback, 15, "正在整理最近几轮对话"
@@ -3540,6 +5281,39 @@ class ImmersiveSimulationOrchestrator(SimulationOrchestrator):
             return "简体中文"
         return "与玩家输入相同的语言"
 
+    @staticmethod
+    def _is_passive_continue_input(text):
+        normalized = clean_text(text).casefold()
+        passive_inputs = {
+            "",
+            "继续",
+            "继续剧情",
+            "继续故事",
+            "继续推进",
+            "下一步",
+            "然后呢",
+            "看看周围",
+            "观察",
+            "观察并让局势自然推进",
+            "随便",
+            "无",
+            "没事",
+            "continue",
+            "continue story",
+            "next",
+            "go on",
+            "wait",
+            "look around",
+            "i wait",
+            "i pause",
+        }
+        if normalized in passive_inputs:
+            return True
+        return normalized in {
+            "i pause and pay attention to what is happening around me.",
+            "i pause and pay attention to what is happening around me",
+        }
+
     def _last_visible_narrative(self):
         for event in reversed(self.store.branch["events"]):
             if (
@@ -3549,6 +5323,943 @@ class ImmersiveSimulationOrchestrator(SimulationOrchestrator):
             ):
                 return event["narration"]
         return ""
+
+    @staticmethod
+    def _impact_rank(value):
+        return {
+            "dialogue": 0,
+            "minor_action": 1,
+            "state_change": 2,
+            "high_impact": 3,
+        }.get(clean_text(value).lower(), 1)
+
+    def _mentions_profile(self, text, profile):
+        haystack = clean_text(text)
+        if not haystack:
+            return False
+        names = {
+            profile.get("canonical_name", ""),
+            *profile.get("aliases", []),
+            *profile.get("forms", []),
+            *profile.get("identity", {}).get("aliases", []),
+            *profile.get("identity", {}).get("forms", []),
+        }
+        return any(name and name in haystack for name in names)
+
+    def _runtime_character_state(self, character_id):
+        state = deep_copy(RUNTIME_CHARACTER_DEFAULTS)
+        state.update(
+            deep_copy(
+                self.store.runtime.get("character_runtime", {}).get(
+                    character_id, {}
+                )
+            )
+        )
+        state["character_id"] = character_id
+        return state
+
+    def _character_current_location(self, character_id):
+        runtime_state = self._runtime_character_state(character_id)
+        location_id = clean_text(
+            runtime_state.get("current_location")
+            or runtime_state.get("location_id")
+        )
+        if location_id:
+            return location_id
+        entity_state = (
+            self.store.runtime.get("entity_states", {}).get(character_id, {})
+        )
+        mutable = entity_state.get("mutable_fields", {})
+        return clean_text(
+            mutable.get("current_location") or mutable.get("location_id")
+        )
+
+    def _location_name(self, location_id):
+        location_id = clean_text(location_id)
+        if not location_id:
+            return ""
+        runtime_location = self.store.runtime.get("location_runtime", {}).get(
+            location_id, {}
+        )
+        for key in ("location_name", "name", "summary"):
+            value = clean_text(runtime_location.get(key))
+            if value:
+                return value
+        location = self.location_by_id.get(location_id, {})
+        return clean_text(
+            location.get("canonical_name")
+            or location.get("name")
+            or location.get("display_name")
+            or location_id
+        )
+
+    @staticmethod
+    def _text_mentions_village(text):
+        text = clean_text(text)
+        return any(
+            term in text
+            for term in (
+                "村里",
+                "村子",
+                "村庄",
+                "村口",
+                "村民",
+                "路人",
+                "行人",
+                "农人",
+                "乡民",
+                "庄户",
+                "附近村",
+                "村落",
+            )
+        )
+
+    @staticmethod
+    def _turn_text(*parts):
+        return clean_text(
+            "；".join(clean_text(part) for part in parts if clean_text(part))
+        )
+
+    def _runtime_location_record(self, location_id, name, origin_id="", reason=""):
+        return {
+            "location_id": clean_text(location_id),
+            "location_name": clean_text(name) or clean_text(location_id),
+            "name": clean_text(name) or clean_text(location_id),
+            "origin_location_id": clean_text(origin_id),
+            "summary": clean_text(name) or clean_text(location_id),
+            "source": "runtime_scene_transition",
+            "reason": clean_text(reason),
+            **deep_copy(RUNTIME_LOCATION_DEFAULTS),
+        }
+
+    def _nearby_village_location(self, origin_location_id):
+        origin_location_id = clean_text(origin_location_id)
+        origin_name = self._location_name(origin_location_id)
+        label = (
+            f"{origin_name}附近村落"
+            if origin_name and "村" not in origin_name
+            else "附近村落"
+        )
+        location_id = (
+            "runtime_location_"
+            + stable_hash(
+                {
+                    "origin": origin_location_id or "unknown_origin",
+                    "kind": "nearby_village",
+                    "label": label,
+                }
+            )[:12]
+        )
+        return self._runtime_location_record(
+            location_id,
+            label,
+            origin_id=origin_location_id,
+            reason="玩家行动进入或已经处于附近村落，但原著数据库没有独立地点实体。",
+        )
+
+    def _normalize_location_for_turn(
+        self,
+        candidate_id,
+        text,
+        origin_id,
+        candidate_name="",
+    ):
+        candidate_id = clean_text(candidate_id)
+        origin_id = clean_text(origin_id)
+        candidate_name = clean_text(candidate_name)
+        reference_id = candidate_id or origin_id
+        reference_name = candidate_name or self._location_name(reference_id)
+        if self._text_mentions_village(text) and "村" not in reference_name:
+            return self._nearby_village_location(origin_id or candidate_id)
+        if candidate_id:
+            return self._runtime_location_record(
+                candidate_id,
+                candidate_name or self._location_name(candidate_id),
+                origin_id=origin_id,
+                reason="LLM 或裁定层提交了角色位置变化。",
+            )
+        return self._runtime_location_record(
+            origin_id,
+            self._location_name(origin_id),
+            origin_id=origin_id,
+            reason="沿用当前场景地点。",
+        )
+
+    @staticmethod
+    def _state_change_subject(change):
+        return clean_text(
+            change.get("subject_id")
+            or change.get("target_id")
+            or change.get("target")
+            or change.get("entity_id")
+            or change.get("character_id")
+        )
+
+    @staticmethod
+    def _state_change_field(change):
+        return clean_text(
+            change.get("field")
+            or change.get("property")
+            or change.get("change_type")
+        )
+
+    @staticmethod
+    def _state_change_after(change):
+        if "after" in change:
+            return change.get("after")
+        if "new_value" in change:
+            return change.get("new_value")
+        return change.get("value")
+
+    def _location_record_from_turn_outputs(
+        self,
+        player_id,
+        player_intent=None,
+        local_world=None,
+        resolution=None,
+        raw_user_input="",
+        scene_location_id="",
+    ):
+        current_id = (
+            self._character_current_location(player_id)
+            or clean_text(scene_location_id)
+        )
+        candidate_name = ""
+        runtime_state = self._runtime_character_state(player_id)
+        text = self._turn_text(
+            raw_user_input,
+            (player_intent or {}).get("injected_thought", ""),
+            (player_intent or {}).get("resolved_intent", ""),
+            (player_intent or {}).get("thought_assimilation", ""),
+            runtime_state.get("current_activity", ""),
+            runtime_state.get("short_term_goal", ""),
+            runtime_state.get("attention_target", ""),
+        )
+        candidate_id = ""
+        scene_transition = (local_world or {}).get("scene_transition")
+        if isinstance(scene_transition, dict):
+            candidate_id = clean_text(
+                scene_transition.get("location_id")
+                or scene_transition.get("new_location_id")
+            )
+            candidate_name = clean_text(
+                scene_transition.get("location_name")
+                or scene_transition.get("name")
+            )
+        for change in (resolution or {}).get("state_changes", []) or []:
+            if not isinstance(change, dict):
+                continue
+            if self._state_change_subject(change) != player_id:
+                continue
+            field = self._state_change_field(change)
+            if "location" in field:
+                candidate_id = clean_text(self._state_change_after(change))
+        for update in (local_world or {}).get("npc_position_updates", []) or []:
+            if not isinstance(update, dict):
+                continue
+            character_id = clean_text(
+                update.get("character_id")
+                or update.get("entity_id")
+                or update.get("actor_id")
+            )
+            if character_id != player_id:
+                continue
+            candidate_id = clean_text(
+                update.get("new_location_id")
+                or update.get("location_id")
+                or update.get("destination_location_id")
+            )
+        return self._normalize_location_for_turn(
+            candidate_id,
+            text,
+            current_id,
+            candidate_name=candidate_name,
+        )
+
+    def _scene_with_effective_location(self, scene, location_record):
+        result = deep_copy(scene or {})
+        location_id = clean_text(location_record.get("location_id"))
+        if location_id:
+            result["location_id"] = location_id
+        if location_record.get("location_name"):
+            result["location_name"] = location_record.get("location_name")
+        return result
+
+    @staticmethod
+    def _availability_is_active(value):
+        value = clean_text(value).lower()
+        if not value:
+            return True
+        dormant_terms = (
+            "dormant",
+            "background",
+            "sleeping",
+            "offscreen",
+            "left_scene",
+            "away",
+            "unavailable",
+            "dead",
+            "inactive",
+        )
+        return not any(term in value for term in dormant_terms)
+
+    def _same_location(self, left, right):
+        left = clean_text(left)
+        right = clean_text(right)
+        return bool(left and right and left == right)
+
+    def _active_nearby_character_ids(
+        self,
+        user_input,
+        player_id,
+        scene,
+        effective_location_id,
+    ):
+        effective_location_id = clean_text(effective_location_id)
+        scene = scene or {}
+        scene_ids = [
+            item
+            for item in scene.get("participant_ids", [])
+            if item != player_id
+        ]
+        runtime_ids = [
+            character_id
+            for character_id, state in self.store.runtime.get(
+                "character_runtime", {}
+            ).items()
+            if character_id != player_id
+            and self._is_known_character_id(character_id)
+            and self._same_location(
+                clean_text(state.get("current_location")),
+                effective_location_id,
+            )
+        ]
+        candidate_ids = compact_list([*scene_ids, *runtime_ids], 64)
+        selected = []
+        for character_id in candidate_ids:
+            if not self._is_known_character_id(character_id):
+                continue
+            state = self._runtime_character_state(character_id)
+            if not self._availability_is_active(state.get("availability")):
+                continue
+            location_id = self._character_current_location(character_id)
+            if effective_location_id and location_id:
+                if location_id != effective_location_id:
+                    continue
+            elif effective_location_id and not location_id:
+                continue
+            profile = self._dynamic_profile(character_id)
+            mentioned = self._mentions_profile(user_input, profile)
+            in_scene = character_id in scene_ids
+            if not mentioned and not in_scene and len(selected) >= self.max_nearby_agents:
+                continue
+            selected.append(character_id)
+        return compact_list(selected, self.max_nearby_agents)
+
+    @staticmethod
+    def _action_text_for_follow_check(npc_action):
+        intent = npc_action.get("action_intent", {}) if isinstance(npc_action, dict) else {}
+        return clean_text(
+            "；".join(
+                [
+                    npc_action.get("visible_behavior", ""),
+                    npc_action.get("goal", ""),
+                    npc_action.get("dialogue", ""),
+                    intent.get("action_type", ""),
+                    intent.get("description", ""),
+                ]
+            )
+        )
+
+    def _npc_explicitly_stays_with_player(self, npc_action, user_input):
+        text = self._action_text_for_follow_check(npc_action)
+        if self._mentions_profile(user_input, {"canonical_name": npc_action.get("canonical_name", "")}):
+            return True
+        return any(
+            term in text
+            for term in (
+                "跟随",
+                "随行",
+                "同行",
+                "陪同",
+                "追上",
+                "追赶",
+                "拦住",
+                "拉住",
+                "同行移动",
+                "护送",
+            )
+        )
+
+    @staticmethod
+    def _ambient_reaction_text(reaction):
+        if not isinstance(reaction, dict):
+            return ""
+        return clean_text(
+            "；".join(
+                clean_text(reaction.get(key))
+                for key in ("speaker_label", "visible_behavior", "dialogue")
+                if clean_text(reaction.get(key))
+            )
+        )
+
+    @staticmethod
+    def _input_refers_to_recent_ambient(text, label):
+        text = clean_text(text)
+        label = clean_text(label)
+        if label and label in text:
+            return True
+        pronouns = {"他", "她", "那人", "那个人", "老汉", "此人", "对方"}
+        interaction_terms = {
+            "问",
+            "说",
+            "聊",
+            "威胁",
+            "逼问",
+            "质问",
+            "审问",
+            "吓",
+            "恐吓",
+            "咨询",
+            "追问",
+            "拦",
+            "放过",
+        }
+        return any(term in text for term in pronouns) and any(
+            term in text for term in interaction_terms
+        )
+
+    def _recent_ambient_candidates(self, limit=4):
+        candidates = []
+        current_location = clean_text(
+            (self.store.runtime.get("active_scene") or {}).get("location_id")
+        )
+        for event in reversed(self.store.branch.get("events", [])):
+            local_world = event.get("local_world", {})
+            if not isinstance(local_world, dict):
+                continue
+            runtime_scene = (
+                event.get("runtime_updates", {}).get("active_scene", {})
+                if isinstance(event.get("runtime_updates"), dict)
+                else {}
+            )
+            event_location = clean_text(
+                runtime_scene.get("location_id")
+                or (
+                    local_world.get("scene_transition", {})
+                    if isinstance(local_world.get("scene_transition"), dict)
+                    else {}
+                ).get("location_id")
+                or (self.store.runtime.get("active_scene") or {}).get("location_id")
+            )
+            for reaction in reversed(local_world.get("ambient_npc_reactions", [])):
+                if not isinstance(reaction, dict):
+                    continue
+                label = clean_text(reaction.get("speaker_label"))
+                if not label:
+                    continue
+                text = self._ambient_reaction_text(reaction)
+                candidates.append(
+                    {
+                        "label": label,
+                        "text": text,
+                        "event_id": event.get("event_id", ""),
+                        "location_id": event_location or current_location,
+                    }
+                )
+                if len(candidates) >= limit:
+                    return candidates
+        return candidates
+
+    def _ensure_runtime_npc(
+        self,
+        label,
+        location_id,
+        memory_text="",
+        seed_event_id="",
+        availability="active_nearby_npc",
+    ):
+        location_id = clean_text(location_id) or clean_text(
+            (self.store.runtime.get("active_scene") or {}).get("location_id")
+        )
+        character_id = self._existing_runtime_npc_id(label, location_id)
+        if not character_id:
+            character_id = self._runtime_npc_id(label, location_id)
+        profiles = self._runtime_npc_profiles()
+        if character_id not in profiles:
+            profiles[character_id] = self._runtime_npc_profile(
+                character_id,
+                label,
+                location_id,
+                seed_event_id=seed_event_id,
+                memory_text=memory_text,
+            )
+        else:
+            profile = profiles[character_id]
+            attributes = profile.setdefault("attributes", {})
+            attributes.setdefault("location_id", location_id)
+            attributes["last_location_id"] = location_id
+            if seed_event_id:
+                attributes["last_source_event_id"] = clean_text(seed_event_id)
+            if memory_text:
+                memories = profile.setdefault("memories", [])
+                if not any(
+                    clean_text(item.get("source_text")) == clean_text(memory_text)
+                    for item in memories
+                    if isinstance(item, dict)
+                ):
+                    memories.append(
+                        {
+                            "source_text": clean_text(memory_text),
+                            "relation_summary": clean_text(memory_text),
+                            "source_event_id": clean_text(seed_event_id),
+                        }
+                    )
+                profile["memories"] = memories[-12:]
+        runtime = self.store.runtime.setdefault("character_runtime", {})
+        existing = runtime.get(character_id, {})
+        runtime[character_id] = {
+            **deep_copy(RUNTIME_CHARACTER_DEFAULTS),
+            **deep_copy(existing),
+            "character_id": character_id,
+            "current_location": location_id,
+            "current_activity": clean_text(memory_text) or existing.get(
+                "current_activity",
+                "正在与玩家角色互动",
+            ),
+            "availability": availability,
+            "short_term_goal": existing.get(
+                "short_term_goal",
+                "在当前威胁下保全自己，必要时顺从、拖延、误导或寻找逃离机会",
+            ),
+            "known_information": compact_list(
+                [
+                    *existing.get("known_information", []),
+                    clean_text(memory_text),
+                ],
+                16,
+            ),
+        }
+        memory = self.store.runtime.setdefault("agent_memories", {}).setdefault(
+            character_id,
+            {
+                "recent_event_ids": [],
+                "summary": "",
+                "last_revision": self.store.branch.get("head_revision", 0),
+            },
+        )
+        if seed_event_id:
+            memory["recent_event_ids"] = compact_list(
+                [*memory.get("recent_event_ids", []), seed_event_id],
+                24,
+            )
+        if memory_text and memory_text not in clean_text(memory.get("summary")):
+            memory["summary"] = clean_text(
+                "；".join(
+                    item
+                    for item in [memory.get("summary", ""), memory_text]
+                    if clean_text(item)
+                )
+            )[-1200:]
+        return character_id
+
+    def _promote_referenced_ambient_npcs(self, user_input, player_id, scene):
+        scene = scene or {}
+        candidates = self._recent_ambient_candidates()
+        explicit = [
+            candidate
+            for candidate in candidates
+            if clean_text(candidate.get("label"))
+            and clean_text(candidate.get("label")) in clean_text(user_input)
+        ]
+        if explicit:
+            selected_candidates = explicit[:1]
+        elif candidates and self._input_refers_to_recent_ambient(
+            user_input,
+            candidates[0].get("label"),
+        ):
+            selected_candidates = candidates[:1]
+        else:
+            selected_candidates = []
+        promoted_ids = []
+        for candidate in selected_candidates:
+            character_id = self._ensure_runtime_npc(
+                candidate.get("label"),
+                candidate.get("location_id") or scene.get("location_id"),
+                memory_text=candidate.get("text"),
+                seed_event_id=candidate.get("event_id"),
+            )
+            promoted_ids.append(character_id)
+        promoted_ids = compact_list(promoted_ids, self.max_nearby_agents)
+        if promoted_ids:
+            participants = compact_list(
+                [
+                    player_id,
+                    *scene.get("participant_ids", []),
+                    *promoted_ids,
+                ],
+                self.max_nearby_agents + 1,
+            )
+            scene["participant_ids"] = participants
+            active_scene = self.store.runtime.get("active_scene")
+            if isinstance(active_scene, dict):
+                active_scene["participant_ids"] = participants
+        return promoted_ids
+
+    def _group_context_packet(self, user_input, player_intent, scene):
+        scene = scene or {}
+        location_id = clean_text(scene.get("location_id"))
+        location_name = clean_text(scene.get("location_name"))
+        runtime_location = self.store.runtime.get("location_runtime", {}).get(
+            location_id,
+            {},
+        )
+        text = self._turn_text(
+            user_input,
+            player_intent.get("resolved_intent", ""),
+            player_intent.get("thought_assimilation", ""),
+            scene.get("summary", ""),
+            location_name,
+            location_id,
+            runtime_location.get("ambient_sound", ""),
+            runtime_location.get("ongoing_events", []),
+        )
+        groups = [
+            (
+                "village_people",
+                "附近村民",
+                ("村", "村民", "村落", "茅屋", "庄户", "乡民", "犬吠"),
+            ),
+            (
+                "market_crowd",
+                "市集人群",
+                ("市集", "市场", "商贩", "摊", "街市", "买卖", "行人"),
+            ),
+            (
+                "soldiers",
+                "附近士兵",
+                ("士兵", "官兵", "军队", "巡逻", "守卫", "卫兵", "兵卒"),
+            ),
+            (
+                "guards_servants",
+                "侍从与护卫",
+                ("侍从", "仆从", "护卫", "宫人", "衙役", "随从"),
+            ),
+            (
+                "demons",
+                "附近小妖",
+                ("小妖", "妖兵", "妖怪", "洞府", "巡山", "喽啰"),
+            ),
+            (
+                "pilgrims_or_monks",
+                "附近僧众香客",
+                ("僧众", "香客", "寺", "庙", "行僧", "和尚"),
+            ),
+            (
+                "general_crowd",
+                "周围人群",
+                ("人群", "群众", "百姓", "路人", "围观", "众人"),
+            ),
+        ]
+        matched = []
+        for group_type, label, terms in groups:
+            if (
+                group_type == "village_people"
+                and "离开村" in text
+                and "村" not in location_name
+                and not any(term in text for term in ("村民", "茅屋", "庄户", "乡民", "犬吠"))
+            ):
+                continue
+            if any(term in text for term in terms):
+                matched.append(
+                    {
+                        "group_type": group_type,
+                        "label": label,
+                        "terms": [term for term in terms if term in text][:6],
+                    }
+                )
+        if not matched:
+            return {"should_run": False, "groups": [], "text": text}
+        trigger_terms = (
+            "威胁",
+            "恐吓",
+            "打",
+            "杀",
+            "火",
+            "妖",
+            "追",
+            "喊",
+            "哭",
+            "逃",
+            "闯",
+            "搜",
+            "找",
+            "问",
+            "赶路",
+            "进入",
+            "离开",
+            "等待",
+            "继续",
+        )
+        visible_pressure = any(term in text for term in trigger_terms)
+        should_run = bool(
+            visible_pressure
+            or self._is_passive_continue_input(user_input)
+            or self._text_mentions_village(text)
+        )
+        return {
+            "should_run": should_run,
+            "groups": matched[:2],
+            "text": text,
+            "location_id": location_id,
+            "location_name": location_name or self._location_name(location_id),
+        }
+
+    def _group_controller_agent(
+        self,
+        user_input,
+        player_intent,
+        npc_actions,
+        elapsed_minutes,
+        context,
+    ):
+        scene = (context or {}).get("scene") or self.store.runtime.get("active_scene") or {}
+        packet = self._group_context_packet(user_input, player_intent, scene)
+        if not packet.get("should_run"):
+            return {
+                "ran": False,
+                "policy": "lazy_group_controller",
+                "resource_mode": "deterministic_no_llm",
+                "groups": [],
+                "reason": "当前场景未检测到需要统一模拟的群众/村民/士兵等群体。",
+            }
+        text = packet.get("text", "")
+        action_text = self._turn_text(
+            text,
+            *[
+                self._action_text_for_follow_check(item)
+                for item in npc_actions
+                if isinstance(item, dict)
+            ],
+        )
+        threat = any(
+            term in action_text
+            for term in (
+                "威胁",
+                "恐吓",
+                "杀",
+                "妖",
+                "火",
+                "惨",
+                "抓",
+                "拽",
+                "哭",
+                "惊",
+                "逃",
+            )
+        )
+        inquiry = any(term in action_text for term in ("问", "打听", "询问", "搜寻", "找"))
+        movement = any(
+            term in action_text
+            for term in ("进入", "离开", "经过", "赶路", "继续", "跟着", "带路")
+        )
+        groups = []
+        runtime_groups = self.store.runtime.setdefault("group_runtime", {})
+        for item in packet.get("groups", []):
+            label = item.get("label") or "周围人群"
+            group_id = "runtime_group_" + stable_hash(
+                {
+                    "label": label,
+                    "location_id": packet.get("location_id"),
+                    "group_type": item.get("group_type"),
+                }
+            )[:16]
+            previous = runtime_groups.get(group_id, {})
+            if threat:
+                mood = "恐慌警觉"
+                goal = "避开危险、保护同伴，并把异常消息传给附近的人。"
+                visible = (
+                    f"{label}不再只是背景声；靠近动静的人压低声音互相提醒，"
+                    "门窗逐渐合上，胆小者往阴影和屋舍后退。"
+                )
+                pressure = "群体恐慌会让消息扩散，也可能引来更多旁观或守卫。"
+            elif inquiry:
+                mood = "戒备观望"
+                goal = "判断来者意图，交换传闻，同时避免被卷入冲突。"
+                visible = (
+                    f"{label}远远观察着问话与搜寻，低声交换传闻，"
+                    "没有人愿意第一个走近。"
+                )
+                pressure = "群体传闻会影响后续 NPC 的警惕与可获得线索。"
+            elif movement:
+                mood = "避让警觉"
+                goal = "给强势角色让路，并把异常路线记在心里。"
+                visible = (
+                    f"{label}察觉队伍移动后本能地让开道路，"
+                    "视线追着他们消失的方向。"
+                )
+                pressure = "群体会把移动方向转化成局部消息。"
+            else:
+                mood = previous.get("mood", "低声观望")
+                goal = "维持日常秩序，同时留意异常。"
+                visible = f"{label}维持着低声的日常活动，但注意力已经被现场变化牵动。"
+                pressure = "群体注意力会让场景不再完全静止。"
+            groups.append(
+                {
+                    "group_id": group_id,
+                    "label": label,
+                    "group_type": item.get("group_type", "general_crowd"),
+                    "location_id": packet.get("location_id"),
+                    "mood": mood,
+                    "goal": goal,
+                    "visible_behavior": visible,
+                    "dialogue": "",
+                    "pressure": pressure,
+                    "source_terms": item.get("terms", []),
+                    "state_update": {
+                        "mood": mood,
+                        "current_activity": visible,
+                        "last_pressure": pressure,
+                        "last_seen_player_intent": clean_text(
+                            player_intent.get("resolved_intent")
+                        )[:240],
+                    },
+                }
+            )
+        return {
+            "ran": True,
+            "policy": "common_sense_group_controller",
+            "resource_mode": "deterministic_no_llm",
+            "trigger_reason": "检测到当前地点存在群体语境，统一模拟其常识性反应。",
+            "elapsed_minutes": elapsed_minutes,
+            "groups": groups,
+        }
+
+    @staticmethod
+    def _group_controller_ran(group_controller):
+        return bool(
+            isinstance(group_controller, dict)
+            and group_controller.get("ran")
+            and group_controller.get("groups")
+        )
+
+    def _merge_group_controller_into_local_world(self, local_world, group_controller):
+        if not self._group_controller_ran(group_controller):
+            return local_world
+        local_world = local_world if isinstance(local_world, dict) else {}
+        local_world["group_controller"] = deep_copy(group_controller)
+        reactions = local_world.setdefault("ambient_npc_reactions", [])
+        new_events = local_world.setdefault("new_events", [])
+        world_changes = local_world.setdefault("world_changes", [])
+        existing_reactions = {
+            (
+                clean_text(item.get("speaker_label")),
+                clean_text(item.get("visible_behavior")),
+            )
+            for item in reactions
+            if isinstance(item, dict)
+        }
+        existing_events = {
+            clean_text(item if isinstance(item, str) else item.get("description", ""))
+            for item in new_events
+        }
+        for group in group_controller.get("groups", []):
+            label = clean_text(group.get("label")) or "周围人群"
+            visible = clean_text(group.get("visible_behavior"))
+            if visible and (label, visible) not in existing_reactions:
+                reactions.append(
+                    {
+                        "speaker_label": label,
+                        "visible_behavior": visible,
+                        "dialogue": clean_text(group.get("dialogue")),
+                        "source": "group_controller",
+                        "is_group": True,
+                        "group_id": group.get("group_id"),
+                    }
+                )
+            event_text = clean_text(group.get("pressure"))
+            if event_text and event_text not in existing_events:
+                new_events.append(event_text)
+                world_changes.append(event_text)
+                existing_events.add(event_text)
+        return local_world
+
+    def _agent_wake_plan(self, user_input, player_intent, profiles, elapsed_minutes, scene=None):
+        passive = self._is_passive_continue_input(user_input)
+        impact = self._impact_rank(
+            player_intent.get("impact_level") or player_intent.get("action_type")
+        )
+        action_type = clean_text(player_intent.get("action_type")).lower()
+        stateful = impact >= 2 or action_type in {
+            "state_change",
+            "high_impact",
+            "travel",
+            "sleep",
+            "leave_region",
+            "fast_forward",
+            "internal_doubt",
+            "refusal",
+            "resistance",
+            "avoidance",
+            "change_plan",
+            "reject_order",
+        }
+        wake_all_npcs = bool(
+            passive
+            or elapsed_minutes >= 5
+            or impact >= 2
+            or self._intent_implies_canon_divergence(player_intent)
+        )
+        max_auto_npcs = self.max_nearby_agents if wake_all_npcs else min(2, self.max_nearby_agents)
+        selected = []
+        for profile in profiles:
+            if self._mentions_profile(user_input, profile):
+                selected.append(profile)
+                continue
+            if wake_all_npcs:
+                selected.append(profile)
+                continue
+            if len(selected) < max_auto_npcs:
+                selected.append(profile)
+        selected = selected[:max_auto_npcs]
+        should_run_local_world = bool(
+            passive
+            or elapsed_minutes > 0
+            or stateful
+            or self._intent_implies_canon_divergence(player_intent)
+        )
+        group_context = self._group_context_packet(user_input, player_intent, scene or {})
+        should_run_group_controller = bool(group_context.get("should_run"))
+        should_run_gm = bool(
+            stateful
+            or should_run_local_world
+            or should_run_group_controller
+            or self._intent_implies_canon_divergence(player_intent)
+        )
+        return {
+            "policy": "lazy_multi_agent_scheduler",
+            "passive_continue": passive,
+            "impact_rank": impact,
+            "stateful_or_divergent": stateful,
+            "wake_all_npcs": wake_all_npcs,
+            "selected_npc_ids": [item["character_id"] for item in selected],
+            "skipped_npc_ids": [
+                item["character_id"]
+                for item in profiles
+                if item["character_id"] not in {p["character_id"] for p in selected}
+            ],
+            "should_run_local_world": should_run_local_world,
+            "should_run_group_controller": should_run_group_controller,
+            "group_controller_context": {
+                key: value
+                for key, value in group_context.items()
+                if key in {"groups", "location_id", "location_name"}
+            },
+            "should_run_gm": should_run_gm,
+            "reason": (
+                "高影响/时间推进/继续/偏离原著会唤醒更多 Agent；普通小动作只唤醒相关或少量附近角色；检测到人群/村民/士兵等群体语境时唤醒 Group Controller。"
+            ),
+        }
 
     def _baseline_concept_card(self, concept_id, fallback=None):
         concept = self.world_concept_by_id.get(concept_id, {})
@@ -4325,7 +7036,7 @@ class ImmersiveSimulationOrchestrator(SimulationOrchestrator):
         system,
         user,
         temperature=0.75,
-        max_tokens=6200,
+        max_tokens=2600,
     ):
         return str(
             self.call_llm(
@@ -4343,13 +7054,33 @@ class ImmersiveSimulationOrchestrator(SimulationOrchestrator):
             .get(profile["character_id"], context)
         )
         system = """
-你是 Player Character Controller。玩家控制原著角色的行为，但不能抹除
-角色身份、记忆、关系、长期目标与已知能力。把玩家输入解释成该角色此刻
-真正会尝试的意图；若明显违背人格，只标记冲突并将其转译为带有迟疑、
-挣扎或需要更强动机的尝试，不替玩家拒绝一切偏离。只输出 JSON。
-玩家输入是最高优先级的本轮动作来源：不能忽略、不能改成 NPC 的行动、
-不能退回上一轮。如果玩家要求说一句话或询问某人，resolved_intent 必须
-保留这个说话/询问动作和关键对象。
+你是 Player Character Controller。玩家不是从外部硬控角色肢体，而是像
+钻进角色脑中的念头、冲动、怀疑、判断或一句内心命令。把玩家输入解释成
+这个角色此刻脑中突然出现的想法，再让角色用自身身份、欲望、关系、恐惧、
+处境和正在发生的外界压力消化它。只输出 JSON。
+必须区分真实本体与临时扮演身份：core_motivation.true_self、
+root_drives 和 current_true_objectives 是角色私下判断的核心；任何伪装、
+化身、村姑、老人、商旅或日常身份都只是策略外壳，不能覆盖本体欲望。
+若 actor packet 含 internal_tools，必须优先读取 character_root_lookup、
+motivation_evidence_retriever、graph_neighborhood_tool 和 retrieval_quality_gate。
+质量门为 thin 时，角色应更保守、试探或寻找证据；不得大胆补未知设定。
+若 actor packet 含 motivation_runtime，用 desire_intensity、fear_intensity
+和 disguise_pressure 决定本轮冲动、谨慎、伪装维持或撤退倾向。
+若 motivation_runtime 或 character_root_lookup 含 action_policy，必须遵守：
+根本欲望决定方向，恐惧只改变路线、节奏和伪装强度；除非玩家明确要求
+或角色被外力限制，不能把屏息、僵住、装死、扮石头、反复害怕写成本轮
+最终意图。高风险下应转译为隐蔽推进、换身份、试探、诱导、绕开威胁或
+制造下一步机会。
+玩家输入是最高优先级的“脑内注入”，但不是必须机械执行的外部按钮：
+1. 如果输入是简单命令，如“带上车钥匙”，它应成为角色的念头并影响选择，
+   可能立刻执行，也可能作为后续后果伏笔。
+2. 如果输入是否定判断，如“唐僧肉不好吃”“不要去伏击”，它应真实改变
+   角色的短期动机、怀疑或抗拒，而不是被原著事件自动覆盖。
+3. 如果外界有父亲命令、师门压力、既定伏击、宴会邀请等，它们是现实压力；
+   可以引发劝说、强迫、争执、找借口、拖延或妥协，但不能因为“事件该发生”
+   就强制角色照做。
+4. 如果输入明确要求说一句话或询问某人，resolved_intent 应保留这个说话/
+   询问念头和对象，但表现方式由角色性格与处境决定。
 """.strip()
         user = json.dumps(
             {
@@ -4366,6 +7097,8 @@ class ImmersiveSimulationOrchestrator(SimulationOrchestrator):
                     "character": profile["canonical_name"],
                     "player_input": user_input,
                     "character_context": "",
+                    "injected_thought": user_input,
+                    "thought_assimilation": "",
                     "resolved_intent": "",
                     "action_type": "",
                     "impact_level": "dialogue|minor_action|state_change|high_impact",
@@ -4432,8 +7165,76 @@ class ImmersiveSimulationOrchestrator(SimulationOrchestrator):
             max_tokens=500,
         )
 
+    def _time_service(self, player_intent, user_input):
+        action_type = clean_text(player_intent.get("action_type")).lower()
+        impact = self._impact_rank(
+            player_intent.get("impact_level") or action_type
+        )
+        text = self._turn_text(
+            user_input,
+            player_intent.get("resolved_intent", ""),
+            player_intent.get("thought_assimilation", ""),
+        )
+        elapsed = 1
+        reason = "普通短动作或短对话"
+        if self._is_passive_continue_input(user_input):
+            elapsed = 5
+            reason = "玩家让出主动权，局部场景小幅自然推进"
+        elif action_type in {"sleep", "rest"} or any(
+            term in text for term in ("睡", "休息", "闭关")
+        ):
+            elapsed = 240
+            reason = "长时间休息或闭关"
+        elif action_type in {"travel", "leave_region", "move"} or any(
+            term in text
+            for term in (
+                "前往",
+                "去",
+                "离开",
+                "赶往",
+                "进入",
+                "出发",
+                "赶路",
+            )
+            ):
+            elapsed = 15
+            reason = "局部移动或短途转场"
+        elif action_type in {"train", "practice"} or any(
+            term in text for term in ("修炼", "训练", "练习")
+        ):
+            elapsed = 60
+            reason = "训练或修炼"
+        elif action_type in {"observe", "search"} or any(
+            term in text for term in ("观察", "寻找", "搜寻", "查看")
+        ):
+            elapsed = 5
+            reason = "观察、搜寻或确认环境"
+        elif action_type in {"dialogue", "speak", "ask"} or any(
+            term in text for term in ("问", "说", "答", "打听", "询问")
+        ):
+            elapsed = 2
+            reason = "短对话与打探消息"
+        elif impact >= 3:
+            elapsed = 10
+            reason = "高影响行动需要更长处理时间"
+        triggers_global = bool(
+            elapsed >= 120
+            or action_type in {"travel", "sleep", "fast_forward", "leave_region"}
+            or any(term in text for term in ("数日", "几天", "远方", "跨越"))
+        )
+        return {
+            "elapsed_minutes": elapsed,
+            "reason": reason,
+            "triggers_global_update": triggers_global,
+            "source": "deterministic_time_service",
+        }
+
     def _perception_packet(self, profile, shared_context):
-        scene = self.store.runtime.get("active_scene") or {}
+        scene = (
+            (shared_context or {}).get("scene")
+            or self.store.runtime.get("active_scene")
+            or {}
+        )
         character_id = profile["character_id"]
         actor_context = (
             shared_context.get("rag_orchestration", {})
@@ -4453,6 +7254,11 @@ class ImmersiveSimulationOrchestrator(SimulationOrchestrator):
                 "turn": scene.get("turn", 0),
             },
             "runtime_state": runtime_state,
+            "motivation_runtime": deep_copy(
+                self.store.runtime.get("motivation_runtime", {}).get(
+                    character_id, {}
+                )
+            ),
             "memory": self.store.runtime.get("agent_memories", {}).get(
                 character_id, {}
             ),
@@ -4479,10 +7285,30 @@ class ImmersiveSimulationOrchestrator(SimulationOrchestrator):
 先根据感知边界判断你看见、听见和记得什么，再延续当前活动或自主目标。
 玩家若什么也不做，你仍应继续生活。不得知道场外信息，不得直接读取他人
 内心。高影响行为只提交意图，不宣布成功。
-player_resolved_intent 是玩家角色将要执行或刚执行的动作。你只能对此作出
-自己的反应，绝对不能替玩家说出同一句话、抢先执行相同动作，或把玩家的
-目标据为自己的目标。生理信息只能填写当前证据明确支持的事实，不得把武魂、
-能力或外号推断成种族。只输出 JSON。
+你的自主目标必须来自本体，而不是来自伪装身份。若 character 或
+perception_context 含有 core_motivation，先用 true_self、root_drives、
+current_true_objectives 判断欲望、恐惧和机会；strategy_identities 只说明
+可以如何伪装接近目标，不能把伪装当成真实人生。
+若 perception_context.retrieved_knowledge 含 internal_tools，必须把
+character_root_lookup 作为角色根基，把 motivation_evidence_retriever 作为
+证据来源，把 graph_neighborhood_tool 作为关系/威胁/机会来源；若
+retrieval_quality_gate.status 为 thin，本轮优先观察、试探、保守行动或维持伪装。
+若 perception_context 含 motivation_runtime，用其中的欲望强度、恐惧强度和
+伪装压力决定行动力度：欲望高更主动，恐惧高更谨慎，伪装压力高更注意遮掩。
+若 motivation_runtime 或 character_root_lookup 含 action_policy，按该政策
+行动：风险只能改变策略，不能把自主目标降级成整轮静止、装死、扮石头或
+纯逃避；暂避也要服务下一步接近、试探、诱导、反击或保全机会。
+你不是玩家的服务接口。玩家输入只代表玩家角色的倾向，不是你的命令。
+如果你的目标是保命、护家、隐瞒、逃离或求援，你可以拒绝、拖延、撒谎、
+给出不完整信息、绕远路、寻找旁人、趁混乱逃跑，或表面顺从但私下保留
+自己的机会。只要你能感知到合理机会，就不要把整轮写成单纯害怕。
+player_resolved_intent 是玩家角色消化脑中注入念头后的当前倾向，可能是行动、
+拒绝、怀疑、拖延、找借口或改道。你只能基于自己能感知到的外在表现作出
+反应，不能直接读取玩家角色的内心，也不能替玩家说出同一句话、抢先执行
+相同动作，或把玩家的目标据为自己的目标。若你与玩家角色有权力、亲属、
+师徒或敌对关系，可以劝说、逼迫、阻拦或惩罚，但这必须来自你的自身目标
+和可见信息。生理信息只能填写当前证据明确支持的事实，不得把武魂、能力
+或外号推断成种族。只输出 JSON。
 """.strip()
         user = json.dumps(
             {
@@ -4561,6 +7387,7 @@ player_resolved_intent 是玩家角色将要执行或刚执行的动作。你只
         self,
         player_intent,
         npc_actions,
+        group_controller,
         elapsed_minutes,
         context,
     ):
@@ -4602,6 +7429,17 @@ player_resolved_intent 是玩家角色将要执行或刚执行的动作。你只
 你是 Local World Agent，只管理当前房间或邻近小区域。根据玩家意图、NPC
 可见行为和时间流逝更新环境、角色位置、物品位置、声音、气味、光线与局部
 事件。不要裁定攻击、说服、偷窃等成功与否，不写小说正文。
+你不只是等待玩家点名的背景板：如果时间流逝、角色赶路/搜寻/等待，或当前
+环境本身危险/拥挤/荒僻，可以主动提出 0 到 1 个低成本、合理的小事件，
+例如动物惊动、碎石滑落、坑洼、路人远远避开、巡逻经过、天气/火山/树林
+产生变化。小事件必须符合当前地点，不要每轮硬塞，不要抢走主线。
+如果输入里有 group_controller，它代表村民、士兵、群众、侍从等群体的
+统一反应。你必须把它当作局部压力来源：可以让消息扩散、围观避让、恐慌、
+守卫注意、市场骚动或道路变窄，但不能把群体拆成完整命名角色。
+若玩家离开洞府、房间、村口、道路等局部场景，必须给出 scene_transition；
+若目标地点没有原著实体，可创建 runtime_location_* 形式的临时地点。
+普通村民、路人、侍从、小妖等没有独立角色档案的人，只能写在
+ambient_npc_reactions 中，不能冒充已命名 Character Agent。
 你还负责为新出现且缓存中没有说明的物品与能力写面向未读过原著用户的
 简明解释；已有缓存的概念不会发给你，禁止重复改写。只输出 JSON。
 """.strip()
@@ -4610,13 +7448,27 @@ player_resolved_intent 是玩家角色将要执行或刚执行的动作。你只
             json.dumps(
                 {
                     "scene": self.store.runtime.get("active_scene"),
+                    "effective_scene": context.get("scene"),
                     "location_runtime": self.store.runtime.get(
                         "location_runtime", {}
                     ),
                     "player_intent": player_intent,
                     "npc_actions": npc_actions,
+                    "group_controller": group_controller,
                     "elapsed_minutes": elapsed_minutes,
                     "context": local_context,
+                    "local_world_autonomy": {
+                        "can_introduce_spontaneous_events": True,
+                        "event_budget": "0-1 small local event",
+                        "allowed_examples": [
+                            "动物、路人、巡逻、脚印、坑洼、滚石、天气、气味、远处声响",
+                        ],
+                        "forbidden": [
+                            "替 GM 裁定成功失败",
+                            "凭空传送主要角色",
+                            "每轮强行插入大事件",
+                        ],
+                    },
                     "uncached_concepts_requiring_explanation": (
                         missing_concepts
                     ),
@@ -4625,6 +7477,19 @@ player_resolved_intent 是玩家角色将要执行或刚执行的动作。你只
                         "npc_position_updates": [],
                         "object_updates": [],
                         "new_events": [],
+                        "scene_transition": {
+                            "location_id": "",
+                            "location_name": "",
+                            "summary": "",
+                            "participant_ids": [],
+                        },
+                        "ambient_npc_reactions": [
+                            {
+                                "speaker_label": "",
+                                "visible_behavior": "",
+                                "dialogue": "",
+                            }
+                        ],
                         "sensory_environment": {
                             "lighting": "",
                             "ambient_sound": "",
@@ -4647,6 +7512,322 @@ player_resolved_intent 是玩家角色将要执行或刚执行的动作。你只
             max_tokens=1600,
         )
 
+    @staticmethod
+    def _local_world_has_activity(local_world):
+        if not isinstance(local_world, dict):
+            return False
+        return any(
+            local_world.get(key)
+            for key in (
+                "world_changes",
+                "npc_position_updates",
+                "object_updates",
+                "new_events",
+                "ambient_npc_reactions",
+            )
+        )
+
+    def _is_forward_progress_text(self, text):
+        text = clean_text(text)
+        if not text:
+            return False
+        forward_terms = (
+            "继续",
+            "跟着",
+            "跟随",
+            "带路",
+            "领路",
+            "往前",
+            "前面",
+            "深入",
+            "进发",
+            "赶路",
+            "过去",
+            "走",
+            "穿过",
+            "翻过",
+            "绕过",
+            "接近",
+            "追",
+            "搜寻",
+            "寻找",
+            "找唐僧",
+            "看个究竟",
+            "别停",
+            "不停",
+        )
+        stall_terms = (
+            "停下",
+            "等待",
+            "休息",
+            "原地",
+            "回头",
+            "撤退",
+            "离开此地",
+        )
+        if any(term in text for term in stall_terms) and not any(
+            term in text for term in ("别停", "不停")
+        ):
+            return False
+        return any(term in text for term in forward_terms)
+
+    def _recent_forward_progress_count(self, scene, player_intent, elapsed_minutes):
+        scene = scene or {}
+        location_id = clean_text(scene.get("location_id"))
+        current_text = self._turn_text(
+            player_intent.get("resolved_intent", ""),
+            player_intent.get("thought_assimilation", ""),
+            player_intent.get("action_type", ""),
+        )
+        if elapsed_minutes >= 5 and any(
+            term in current_text for term in ("找", "搜", "走", "前", "跟", "带路")
+        ):
+            current_text += " 继续"
+        if not self._is_forward_progress_text(current_text):
+            return 0
+        count = 1
+        for event in reversed(self.store.branch.get("events", [])[-6:]):
+            runtime_scene = (
+                event.get("runtime_updates", {}).get("active_scene", {})
+                if isinstance(event.get("runtime_updates"), dict)
+                else {}
+            )
+            event_local_world = (
+                event.get("local_world", {})
+                if isinstance(event.get("local_world"), dict)
+                else {}
+            )
+            event_location = clean_text(
+                runtime_scene.get("location_id")
+                or (event_local_world.get("scene_transition", {}) or {}).get(
+                    "location_id"
+                )
+            )
+            if location_id and event_location and event_location != location_id:
+                continue
+            resolved_actions = event.get("resolved_actions", []) or []
+            action_text = self._turn_text(
+                event.get("player_input", ""),
+                event.get("player_intent", {}).get("resolved_intent", "")
+                if isinstance(event.get("player_intent"), dict)
+                else event.get("player_intent", ""),
+                *[
+                    item.get("description", "")
+                    for item in resolved_actions
+                    if isinstance(item, dict)
+                ],
+                *[
+                    item.get("description", "")
+                    for item in event_local_world.get("new_events", [])
+                    if isinstance(item, dict)
+                ],
+                *[
+                    item
+                    for item in event_local_world.get("new_events", [])
+                    if isinstance(item, str)
+                ],
+            )
+            if self._is_forward_progress_text(action_text):
+                count += 1
+        return count
+
+    def _destination_progress_transition(
+        self,
+        local_world,
+        player_intent,
+        elapsed_minutes,
+        context,
+    ):
+        scene = (context or {}).get("scene") or self.store.runtime.get("active_scene") or {}
+        text = self._turn_text(
+            scene.get("location_name", ""),
+            scene.get("location_id", ""),
+            scene.get("summary", ""),
+            player_intent.get("resolved_intent", ""),
+            player_intent.get("thought_assimilation", ""),
+            *[
+                clean_text(item)
+                for key in ("new_events", "world_changes")
+                for item in (local_world or {}).get(key, [])
+                if isinstance(item, str)
+            ],
+        )
+        target_terms = (
+            "樵夫",
+            "带路",
+            "乱石",
+            "前面",
+            "最大",
+            "后面",
+            "唐僧",
+            "僧人",
+            "佛门",
+            "净气",
+            "最后见",
+            "看个究竟",
+        )
+        if not any(term in text for term in target_terms):
+            return {}
+        progress_count = self._recent_forward_progress_count(
+            scene,
+            player_intent,
+            elapsed_minutes,
+        )
+        urgent = any(term in text for term in ("就在前面", "别停", "不停", "看个究竟"))
+        threshold = 2 if urgent else 3
+        if progress_count < threshold:
+            return {}
+        participant_ids = compact_list(
+            scene.get("participant_ids", []),
+            self.max_nearby_agents + 1,
+        )
+        if any(term in text for term in ("乱石", "山径", "佛门", "净气", "唐僧", "僧人")):
+            location_id = "runtime_location_mountain_path_rock_cluster"
+            location_name = "山径深处最大乱石后方"
+            summary = (
+                "抵达樵夫所指的最大乱石后方；本轮必须直接确认这里藏着什么、"
+                "留下了什么，或明确这里并没有目标。"
+            )
+            event_text = (
+                "连续推进后，队伍抵达樵夫所指的乱石后方。佛门净气的源头已经"
+                "近在眼前，本轮必须揭示直接发现，不能再只写接近。"
+            )
+        else:
+            location_id = "runtime_location_reached_local_destination"
+            location_name = "当前目标地点"
+            summary = "连续推进后抵达当前目标点；本轮必须直接呈现到达后的发现。"
+            event_text = "连续推进后，当前局部目标点已经抵达，本轮必须直接呈现发现。"
+        return {
+            "scene_transition": {
+                "location_id": location_id,
+                "location_name": location_name,
+                "summary": summary,
+                "participant_ids": participant_ids,
+            },
+            "event_text": event_text,
+            "progress_count": progress_count,
+            "threshold": threshold,
+            "reveal_requirement": (
+                "必须写出抵达后的明确信息：看见目标、发现痕迹、遭遇陷阱、"
+                "发现空无一物或出现新的阻碍之一。禁止以“即将揭晓/就在前方/准备迎接”收尾。"
+            ),
+        }
+
+    def _spontaneous_local_event_text(self, scene, player_intent, elapsed_minutes):
+        scene = scene or {}
+        text = self._turn_text(
+            scene.get("location_name", ""),
+            scene.get("location_id", ""),
+            scene.get("summary", ""),
+            player_intent.get("resolved_intent", ""),
+            player_intent.get("action_type", ""),
+        )
+        seed = stable_hash(
+            {
+                "revision": self.store.branch.get("head_revision", 0),
+                "location": scene.get("location_id", ""),
+                "intent": player_intent.get("resolved_intent", ""),
+            }
+        )
+        options = []
+        if any(term in text for term in ("火山", "硫磺", "岩浆", "灼热", "火")):
+            options.extend(
+                [
+                    "地底传来一阵低闷震颤，几粒滚烫碎石从岩缝间滑落，短暂改变了前方可走的落脚点。",
+                    "一股更浓的硫磺热气从裂缝里喷出，迫使附近生灵本能地避开那段裸露岩面。",
+                ]
+            )
+        if any(term in text for term in ("山", "乱石", "林", "小径", "灌木")):
+            options.extend(
+                [
+                    "乱石堆后忽然响起细碎滚石声，惊动了灌木里的小兽，也暴露出一条被踩过的偏径。",
+                    "前方枯枝被什么东西踩断，短促声响很快消失在树影深处，留下几处新鲜泥印。",
+                ]
+            )
+        if any(term in text for term in ("村", "茅屋", "路人", "村民")):
+            options.extend(
+                [
+                    "远处茅屋后传来犬吠和压低的人声，有村民察觉异样后匆匆关上木门。",
+                    "小路尽头有背篓村民远远看见动静，立刻绕进屋舍阴影，消息可能会在村中传开。",
+                ]
+            )
+        if any(term in text for term in ("水", "河", "雨", "潮湿")):
+            options.append(
+                "潮湿地面忽然塌陷出一处浅坑，积水晃动，显示刚才有人或兽从这里匆忙经过。"
+            )
+        if not options:
+            options = [
+                "附近环境没有静止不动：远处传来一阵含混声响，短暂暴露出一条可能被经过的路径。",
+                "风向忽然改变，气味和脚步声的位置变得更清楚，也让附近潜藏的动静更难完全遮掩。",
+            ]
+        return options[int(seed[:8], 16) % len(options)]
+
+    def _apply_local_world_autonomy(
+        self,
+        local_world,
+        player_intent,
+        elapsed_minutes,
+        context,
+    ):
+        if not isinstance(local_world, dict):
+            return local_world
+        forced_progress = self._destination_progress_transition(
+            local_world,
+            player_intent,
+            elapsed_minutes,
+            context,
+        )
+        if forced_progress:
+            local_world["scene_transition"] = forced_progress["scene_transition"]
+            event_text = forced_progress["event_text"]
+            if event_text not in [
+                clean_text(item)
+                for item in local_world.setdefault("new_events", [])
+                if isinstance(item, str)
+            ]:
+                local_world["new_events"].append(event_text)
+            if event_text not in [
+                clean_text(item)
+                for item in local_world.setdefault("world_changes", [])
+                if isinstance(item, str)
+            ]:
+                local_world["world_changes"].append(event_text)
+            local_world["forced_progress"] = {
+                "must_reveal_destination": True,
+                "progress_count": forced_progress["progress_count"],
+                "threshold": forced_progress["threshold"],
+                "reveal_requirement": forced_progress["reveal_requirement"],
+            }
+            local_world.setdefault("sensory_environment", {})
+            return local_world
+        if self._local_world_has_activity(local_world):
+            return local_world
+        action_type = clean_text(player_intent.get("action_type")).lower()
+        intent_text = self._turn_text(
+            player_intent.get("resolved_intent", ""),
+            player_intent.get("thought_assimilation", ""),
+        )
+        should_tick = bool(
+            elapsed_minutes >= 5
+            or action_type in {"travel", "move", "search", "observe", "wait"}
+            or any(
+                term in intent_text
+                for term in ("走", "去", "找", "搜", "观察", "等待", "带路", "跟上")
+            )
+        )
+        if not should_tick:
+            return local_world
+        scene = (context or {}).get("scene") or self.store.runtime.get("active_scene") or {}
+        local_event = self._spontaneous_local_event_text(
+            scene,
+            player_intent,
+            elapsed_minutes,
+        )
+        local_world.setdefault("new_events", []).append(local_event)
+        local_world.setdefault("world_changes", []).append(local_event)
+        local_world.setdefault("sensory_environment", {})
+        return local_world
+
     def _gm_resolver(
         self,
         player_intent,
@@ -4662,11 +7843,12 @@ player_resolved_intent 是玩家角色将要执行或刚执行的动作。你只
         )
         system = """
 你是 GM Resolver，只做规则裁定，不写场景、不写文学叙述、不代替角色发言。
-裁定玩家和 NPC 的尝试是否成功以及可提交的状态变化。原著事件是默认会继续
-存在的历史压力，不是强制脚本；玩家可以改变结果。
+裁定玩家角色消化注入念头后的倾向、NPC 的尝试以及可提交的状态变化。
+原著事件是默认会继续存在的历史压力，不是强制脚本；玩家可以改变结果。
 必须把 player_intent 作为第一项 resolved_actions 明确裁定。不能忽略、
-替换或偷偷改成上一轮的行动；若人格冲突，也要让角色实际说出或做出玩家
-要求的尝试，再通过迟疑、语气、生理反应和后果表现冲突。
+替换或偷偷改成上一轮的行动；若角色因注入念头产生拒绝、怀疑、找借口、
+拖延、改道或暂时顺从，也要裁定这种倾向的后果，而不是自动改回原著事件。
+外界人物可以劝说、强迫、阻拦或惩罚，但这属于新的反应，不是“事件必须发生”。
 必须判断当前原著锚点状态：如果本轮只是锚点中的持续过程，填 unchanged；
 如果锚点按原著压力自然完成或进入下一个压力点，填 advanced；如果玩家造成
 不同结果但故事继续，填 altered；如果玩家阻止了该锚点发生或完成，填
@@ -4712,6 +7894,420 @@ prevented。只输出 JSON。
             max_tokens=1800,
         )
 
+    def _fallback_turn_plan(self, player_profile, profiles, user_input):
+        player_id = player_profile["character_id"]
+        passive_continue = self._is_passive_continue_input(user_input)
+        resolved_intent = (
+            "观察并让局势自然推进"
+            if passive_continue
+            else clean_text(user_input)
+        )
+        anchor = self.current_canonical_event()
+        anchor_event = clean_text(anchor.get("event") or anchor.get("summary"))
+        return {
+            "player_intent": {
+                "character_id": player_id,
+                "character": player_profile.get("canonical_name"),
+                "character_context": "",
+                "injected_thought": clean_text(user_input),
+                "thought_assimilation": (
+                    "玩家交出主动权，角色按自身动机和外界压力观察局势。"
+                    if passive_continue
+                    else "这个念头进入角色脑中，并被当前动机与处境转化为短期倾向。"
+                ),
+                "resolved_intent": resolved_intent,
+                "action_type": "minor_action",
+                "impact_level": "minor_action",
+                "target_concept_ids": [],
+                "conflicts_with_character": False,
+                "conflict_reason": "",
+                "emotion": "",
+                "self_state_update": {
+                    "current_activity": resolved_intent,
+                    "short_term_goal": resolved_intent,
+                },
+            },
+            "time_result": {
+                "elapsed_minutes": 5 if passive_continue else 1,
+                "reason": (
+                    "玩家交出主动权，当前场景按角色动机和原著压力小幅推进"
+                    if passive_continue
+                    else "普通对话或短动作"
+                ),
+                "triggers_global_update": False,
+            },
+            "npc_actions": [],
+            "local_world": {
+                "world_changes": [],
+                "npc_position_updates": [],
+                "object_updates": [],
+                "new_events": [anchor_event] if passive_continue and anchor_event else [],
+                "scene_transition": {},
+                "ambient_npc_reactions": [],
+                "sensory_environment": {},
+                "encyclopedia_updates": [],
+            },
+            "resolution": {
+                "success": True,
+                "outcome": "deferred",
+                "consequences": [],
+                "state_changes": [],
+                "resolved_actions": [
+                    {
+                        "actor_id": player_id,
+                        "description": resolved_intent,
+                        "outcome": "deferred",
+                        "state_changes": [],
+                    }
+                ],
+                "player_action_addressed": True,
+                "impact_level": "minor_action",
+                "diverges_from_canon": False,
+                "divergence_reason": "",
+                "canonical_event_status": "advanced" if passive_continue else "unchanged",
+            },
+        }
+
+    def _turn_planner(self, player_profile, profiles, user_input, context):
+        player_id = player_profile["character_id"]
+        actor_packets = (
+            context.get("rag_orchestration", {})
+            .get("agent_packets", {})
+        )
+        def compact_profile(profile):
+            packet = actor_packets.get(profile["character_id"], {})
+            tools = packet.get("internal_tools", {})
+            root_lookup = tools.get("character_root_lookup", {})
+            capabilities = packet.get("capabilities") or profile.get("capabilities", {})
+            capability_names = []
+            for group_name in ("abilities", "owned_items", "used_items"):
+                for item in capabilities.get(group_name, [])[:6]:
+                    capability_names.append(
+                        clean_text(item.get("name") or item.get("canonical_name") or item.get("entity_id"))
+                    )
+            relation_names = []
+            for item in (packet.get("relationships") or profile.get("relationships", []))[:8]:
+                relation_names.append(
+                    clean_text(
+                        item.get("edge_statement")
+                        or item.get("name")
+                        or ",".join(item.get("participant_names", []))
+                    )
+                )
+            return {
+                "character_id": profile["character_id"],
+                "canonical_name": profile.get("canonical_name"),
+                "identity": {
+                    key: value
+                    for key, value in (packet.get("identity") or profile.get("identity", {})).items()
+                    if key in {"canonical_name", "aliases", "titles", "forms", "temporary_identities"}
+                },
+                "true_self": root_lookup.get("true_self"),
+                "root_drives": root_lookup.get("root_drives", [])[:5],
+                "current_objectives": root_lookup.get("current_objectives", [])[:5],
+                "fears": root_lookup.get("fears", [])[:5],
+                "strategies": root_lookup.get("strategies", [])[:5],
+                "trigger_analysis": root_lookup.get("current_trigger_analysis", {}),
+                "action_policy": root_lookup.get("action_policy", {}),
+                "motivation_runtime": packet.get("motivation_runtime", {}),
+                "runtime_state": packet.get("current_runtime_state", {}),
+                "capabilities": compact_list(capability_names, 10),
+                "relationships": compact_list(relation_names, 8),
+                "recent_visible_events": packet.get("recent_visible_events", [])[-3:],
+                "memory_summary": clean_text(packet.get("memory", {}).get("summary", ""))[-500:],
+                "retrieval_quality": tools.get("retrieval_quality_gate", {}),
+            }
+        compact_packets = {}
+        for profile in [player_profile, *profiles]:
+            compact_packets[profile["character_id"]] = compact_profile(profile)
+        passive_continue = self._is_passive_continue_input(user_input)
+        system = """
+你是 Fast Turn Planner。你只负责本轮模拟结构，不写小说正文。
+输出必须是一个 JSON object，不能使用 Markdown 代码块，不能附带解释。
+
+你要一次性决定：玩家角色如何消化脑中被注入的想法、附近 NPC 的公开反应、
+局部环境变化、时间流逝和 GM 裁定。正文会由独立 Scene Renderer 根据你的
+结构另写。
+玩家输入只注入到 player_id 对应角色的内心：它可以是完整计划、简单命令、
+怀疑、否定判断、欲望、恐惧或一闪而过的念头。它不是从外部硬控角色肢体。
+附近 NPC 只能按自身感知和动机反应。
+必须读取每个角色的 core_motivation、motivation_runtime 和 action_policy：
+根本欲望决定方向，恐惧只改变路线、节奏和伪装强度，不能把角色压成整轮
+静止、装死、扮石头或纯逃避。高风险角色应使用隐蔽推进、换身份、试探、
+诱导、绕开威胁、分散注意或保留下一步机会。
+附近 NPC 不是为玩家目标服务的附属按钮。若 NPC 的核心目标是保命、护家、
+逃离、隐瞒或求援，它可以拒绝、拖延、误导、给出不完整信息、绕路、求援、
+趁机逃跑或表面顺从；这些都应写成它自己的 goal/action_intent，而不是
+自动满足玩家角色的需求。
+普通对话或短动作应保持轻量：elapsed_minutes 通常 0-3；不需要让所有 NPC
+都说话；没有必要的局部变化就留空。
+
+原著事件、长辈命令、组织任务、宴会邀请、伏击安排等都是压力，不是铁轨。
+如果注入想法足以改变角色判断，你必须允许故事线 altered 或 prevented：
+例如“唐僧肉不好吃”可以让想吃唐僧肉的角色产生怀疑、抗拒或找借口不去；
+父亲或上级可以因此劝说、质问、强迫、惩罚或重新谈判，但不能因为原事件
+本该发生就把角色自动拉回伏击。
+
+输出 player_intent 时，resolved_intent 应描述角色消化该念头后的真实倾向：
+可能是行动、开口、拖延、怀疑、拒绝、试探、找借口、转向日常或暂时顺从。
+conflicts_with_character 只说明内心阻力；不能用它忽略玩家注入的念头。
+
+如果 passive_continue 为 true，玩家不是执行字面“继续/观察”，而是在让出
+主动权：你必须让当前原著压力、附近 NPC 目标、环境事件或场景时钟小幅但
+具体地向前走。player_intent.resolved_intent 应写成“观察并等待局势推进”
+这一类含义，不能复读玩家原话。此时也要给出至少一个 npc_actions、
+local_world.new_events/world_changes 或 resolution.resolved_actions，让世界
+看起来真的在运行。
+""".strip()
+        user = json.dumps(
+            {
+                "player_id": player_id,
+                "user_input": user_input,
+                "passive_continue": passive_continue,
+                "scene": self.store.runtime.get("active_scene"),
+                "player_profile": compact_packets.get(player_id, {}),
+                "nearby_profiles": [
+                    compact_packets.get(profile["character_id"], {})
+                    for profile in profiles
+                ],
+                "current_canonical_anchor": self._compact_timeline_anchor(
+                    self.current_canonical_event()
+                ),
+                "story_spine": self._compact_renderer_story_spine(
+                    context.get("story_spine", {})
+                ),
+                "output_schema": {
+                    "player_intent": {
+                        "character": player_profile.get("canonical_name"),
+                        "character_context": "",
+                        "injected_thought": user_input,
+                        "thought_assimilation": "",
+                        "resolved_intent": "",
+                        "action_type": "dialogue|minor_action|state_change|high_impact",
+                        "impact_level": "dialogue|minor_action|state_change|high_impact",
+                        "target_concept_ids": [],
+                        "conflicts_with_character": False,
+                        "conflict_reason": "",
+                        "emotion": "",
+                        "self_state_update": {},
+                    },
+                    "time_result": {
+                        "elapsed_minutes": 0,
+                        "reason": "",
+                        "triggers_global_update": False,
+                    },
+                    "npc_actions": [
+                        {
+                            "character_id": "",
+                            "perception": "",
+                            "thought": "仅供模拟器使用的动机摘要",
+                            "emotion": "",
+                            "goal": "",
+                            "visible_behavior": "",
+                            "dialogue": "",
+                            "action_intent": {
+                                "action_type": "",
+                                "description": "",
+                                "impact_level": "dialogue|minor_action|state_change|high_impact",
+                                "target_concept_ids": [],
+                                "ability_concept_id": "",
+                                "artifact_concept_id": "",
+                                "candidate_rule_ids": [],
+                                "proposed_state_changes": [],
+                            },
+                            "concept_refs": [],
+                            "claims": [],
+                            "self_state_update": {},
+                        }
+                    ],
+                    "local_world": {
+                        "world_changes": [],
+                        "npc_position_updates": [],
+                        "object_updates": [],
+                        "new_events": [],
+                        "scene_transition": {},
+                        "ambient_npc_reactions": [],
+                        "sensory_environment": {},
+                        "encyclopedia_updates": [],
+                    },
+                    "resolution": {
+                        "success": True,
+                        "outcome": "success|partial|failed|deferred",
+                        "consequences": [],
+                        "state_changes": [],
+                        "resolved_actions": [],
+                        "player_action_addressed": True,
+                        "impact_level": "dialogue|minor_action|state_change|high_impact",
+                        "diverges_from_canon": False,
+                        "divergence_reason": "",
+                        "canonical_event_status": "unchanged|advanced|altered|prevented",
+                    },
+                },
+            },
+            ensure_ascii=False,
+        )
+        try:
+            payload = self._call_json(system, user, max_tokens=1500)
+        except Exception:
+            payload = self._fallback_turn_plan(player_profile, profiles, user_input)
+        if not isinstance(payload, dict):
+            payload = self._fallback_turn_plan(player_profile, profiles, user_input)
+        fallback = self._fallback_turn_plan(player_profile, profiles, user_input)
+        player_intent = payload.get("player_intent")
+        if not isinstance(player_intent, dict):
+            player_intent = fallback["player_intent"]
+        player_intent["character_id"] = player_id
+        player_intent["resolved_intent"] = (
+            clean_text(player_intent.get("resolved_intent"))
+            or fallback["player_intent"]["resolved_intent"]
+        )
+        player_intent["injected_thought"] = (
+            clean_text(player_intent.get("injected_thought"))
+            or clean_text(user_input)
+        )
+        player_intent["thought_assimilation"] = (
+            clean_text(player_intent.get("thought_assimilation"))
+            or fallback["player_intent"]["thought_assimilation"]
+        )
+        if passive_continue and self._is_passive_continue_input(
+            player_intent["resolved_intent"]
+        ):
+            player_intent["resolved_intent"] = (
+                fallback["player_intent"]["resolved_intent"]
+            )
+        player_intent["action_type"] = (
+            clean_text(player_intent.get("action_type"))
+            or "minor_action"
+        )
+        player_intent["impact_level"] = (
+            clean_text(player_intent.get("impact_level"))
+            or "minor_action"
+        )
+        if not isinstance(player_intent.get("self_state_update"), dict):
+            player_intent["self_state_update"] = {}
+
+        time_result = payload.get("time_result")
+        if not isinstance(time_result, dict):
+            time_result = fallback["time_result"]
+        time_result["elapsed_minutes"] = bounded_int(
+            time_result.get("elapsed_minutes"),
+            default=1,
+            minimum=0,
+        )
+        if passive_continue and time_result["elapsed_minutes"] < 1:
+            time_result["elapsed_minutes"] = 5
+        time_result["triggers_global_update"] = bool(
+            time_result.get("triggers_global_update")
+        )
+
+        profile_by_id = {profile["character_id"]: profile for profile in profiles}
+        npc_actions = []
+        for item in payload.get("npc_actions", []):
+            if not isinstance(item, dict):
+                continue
+            character_id = clean_text(item.get("character_id"))
+            profile = profile_by_id.get(character_id)
+            if not profile:
+                continue
+            proposal = self._normalize_proposal(profile, item) | {
+                "perception": clean_text(item.get("perception")),
+                "emotion": clean_text(item.get("emotion")),
+                "goal": clean_text(item.get("goal")),
+                "visible_behavior": clean_text(item.get("visible_behavior")),
+                "self_state_update": deep_copy(item.get("self_state_update", {})),
+            }
+            npc_actions.append(proposal)
+
+        local_world = payload.get("local_world")
+        if not isinstance(local_world, dict):
+            local_world = fallback["local_world"]
+        local_world.setdefault("world_changes", [])
+        local_world.setdefault("npc_position_updates", [])
+        local_world.setdefault("object_updates", [])
+        local_world.setdefault("new_events", [])
+        local_world.setdefault("scene_transition", {})
+        local_world.setdefault("ambient_npc_reactions", [])
+        local_world.setdefault("sensory_environment", {})
+        local_world.setdefault("encyclopedia_updates", [])
+        local_world = self._apply_local_world_autonomy(
+            local_world,
+            player_intent,
+            time_result.get("elapsed_minutes", 0),
+            context,
+        )
+
+        resolution = payload.get("resolution")
+        if not isinstance(resolution, dict):
+            resolution = fallback["resolution"]
+        resolution.setdefault("outcome", "deferred")
+        resolution.setdefault("consequences", [])
+        resolution.setdefault("state_changes", [])
+        resolution.setdefault("resolved_actions", [])
+        resolution.setdefault("player_action_addressed", True)
+        resolution.setdefault("impact_level", player_intent.get("impact_level", "minor_action"))
+        resolution.setdefault("diverges_from_canon", False)
+        resolution.setdefault("divergence_reason", "")
+        resolution.setdefault("canonical_event_status", "unchanged")
+        resolution["state_changes"] = self._normalize_state_changes_for_commit(
+            resolution.get("state_changes", [])
+        )
+        if (
+            not resolution.get("diverges_from_canon")
+            and self._intent_implies_canon_divergence(player_intent)
+            and clean_text(resolution.get("outcome")).lower()
+            not in {"failed", "blocked"}
+        ):
+            resolution["diverges_from_canon"] = True
+            resolution["canonical_event_status"] = "altered"
+            resolution["divergence_reason"] = (
+                clean_text(resolution.get("divergence_reason"))
+                or "玩家注入念头改变了角色对当前原著压力的判断。"
+            )
+        if (
+            bool(resolution.get("diverges_from_canon"))
+            and clean_text(resolution.get("canonical_event_status")).lower()
+            == "advanced"
+        ):
+            resolution["canonical_event_status"] = "altered"
+        if passive_continue:
+            has_world_movement = any(
+                local_world.get(key)
+                for key in (
+                    "world_changes",
+                    "npc_position_updates",
+                    "object_updates",
+                    "new_events",
+                )
+            )
+            if not npc_actions and not has_world_movement:
+                anchor = self.current_canonical_event()
+                anchor_event = clean_text(
+                    anchor.get("event") or anchor.get("summary")
+                )
+                local_world["new_events"].append(
+                    anchor_event or "当前场景在既有压力下自然推进"
+                )
+                resolution.setdefault("consequences", []).append(
+                    "玩家让出主动权，场景由附近角色、环境和原著压力继续推进。"
+                )
+                resolution.setdefault("resolved_actions", []).append(
+                    {
+                        "actor_id": player_id,
+                        "description": player_intent["resolved_intent"],
+                        "outcome": clean_text(resolution.get("outcome")) or "deferred",
+                        "state_changes": [],
+                    }
+                )
+            if clean_text(resolution.get("canonical_event_status")).lower() == "unchanged":
+                resolution["canonical_event_status"] = "advanced"
+        return {
+            "player_intent": player_intent,
+            "time_result": time_result,
+            "npc_actions": npc_actions,
+            "local_world": local_world,
+            "resolution": resolution,
+        }
+
     def current_canonical_event(self):
         cursor = int(self.store.runtime.get("timeline_cursor", 0))
         timeline = (
@@ -4721,6 +8317,206 @@ prevented。只输出 JSON。
         if not timeline:
             return {}
         return deep_copy(timeline[min(cursor, len(timeline) - 1)])
+
+    @staticmethod
+    def _compact_source_snippets(snippets, limit=4, text_limit=260):
+        compacted = []
+        for item in snippets or []:
+            if not isinstance(item, dict):
+                continue
+            compacted.append(
+                {
+                    "source_chunk_id": item.get("source_chunk_id"),
+                    "character_id": item.get("character_id"),
+                    "surface": item.get("surface") or item.get("name"),
+                    "relation_summary": clean_text(
+                        item.get("relation_summary")
+                    )[:text_limit],
+                    "source_text": clean_text(item.get("source_text"))[:text_limit],
+                    "score": item.get("score"),
+                }
+            )
+            if len(compacted) >= limit:
+                break
+        return compacted
+
+    @staticmethod
+    def _compact_timeline_anchor(anchor):
+        anchor = anchor if isinstance(anchor, dict) else {}
+        return {
+            key: anchor.get(key)
+            for key in (
+                "timeline_id",
+                "event_id",
+                "order",
+                "event",
+                "summary",
+                "location_id",
+                "participant_names",
+                "participants",
+                "default_outcome",
+                "status",
+            )
+            if anchor.get(key) not in (None, "", [], {})
+        }
+
+    def _compact_renderer_story_spine(self, spine=None):
+        spine = spine if isinstance(spine, dict) else self._actor_story_spine(
+            include_future=False
+        )
+        narrative_state = spine.get("narrative_spine_state", {})
+        return {
+            "timeline_cursor": spine.get("timeline_cursor"),
+            "timeline_event_count": spine.get("timeline_event_count"),
+            "current_anchor": self._compact_timeline_anchor(
+                spine.get("current_anchor", {})
+            ),
+            "narrative_spine_state": {
+                key: narrative_state.get(key)
+                for key in (
+                    "status",
+                    "last_canonical_event_status",
+                    "last_outcome",
+                    "timeline_cursor_before",
+                    "timeline_cursor_after",
+                )
+                if narrative_state.get(key) not in (None, "", [], {})
+            },
+            "control_contract": {
+                "manual_actor_id": (
+                    (self.store.runtime.get("active_scene") or {}).get(
+                        "focus_character_id"
+                    )
+                ),
+                "canonical_policy": (
+                    "原著是压力和期待，不是强制脚本；玩家行动可以改变结果。"
+                ),
+            },
+        }
+
+    def _compact_renderer_character(self, profile):
+        return {
+            "character_id": profile.get("character_id"),
+            "canonical_name": profile.get("canonical_name"),
+            "identity": {
+                key: value
+                for key, value in profile.get("identity", {}).items()
+                if key
+                in {
+                    "canonical_name",
+                    "aliases",
+                    "titles",
+                    "forms",
+                    "temporary_identities",
+                }
+            },
+            "background_summary": clean_text(
+                profile.get("background_summary")
+            )[:700],
+            "personality": profile.get("personality", [])[:8],
+            "goals": profile.get("goals", [])[:8],
+            "constraints": profile.get("constraints", [])[:8],
+            "core_motivation": deep_copy(profile.get("core_motivation", {})),
+        }
+
+    def _compact_renderer_actor_packet(self, packet):
+        tools = packet.get("internal_tools", {}) if isinstance(packet, dict) else {}
+        root_lookup = tools.get("character_root_lookup", {})
+        evidence = tools.get("motivation_evidence_retriever", {})
+        capabilities = packet.get("capabilities", {}) if isinstance(packet, dict) else {}
+        capability_names = []
+        for group_name in ("abilities", "owned_items", "used_items"):
+            for item in capabilities.get(group_name, [])[:5]:
+                capability_names.append(
+                    clean_text(
+                        item.get("name")
+                        or item.get("canonical_name")
+                        or item.get("entity_id")
+                    )
+                )
+        relationships = []
+        for item in (packet.get("relationships", []) if isinstance(packet, dict) else [])[:6]:
+            relationships.append(
+                clean_text(
+                    item.get("edge_statement")
+                    or item.get("name")
+                    or ",".join(item.get("participant_names", []))
+                )
+            )
+        recent_events = []
+        for item in (packet.get("recent_visible_events", []) if isinstance(packet, dict) else [])[-3:]:
+            recent_events.append(
+                {
+                    "event_type": item.get("event_type"),
+                    "narration": clean_text(item.get("narration"))[-500:],
+                    "revision_after": item.get("revision_after"),
+                }
+            )
+        return {
+            "character_id": packet.get("character_id") if isinstance(packet, dict) else "",
+            "canonical_name": packet.get("canonical_name") if isinstance(packet, dict) else "",
+            "identity": {
+                key: value
+                for key, value in (packet.get("identity", {}) if isinstance(packet, dict) else {}).items()
+                if key
+                in {
+                    "canonical_name",
+                    "aliases",
+                    "titles",
+                    "forms",
+                    "temporary_identities",
+                }
+            },
+            "root": {
+                "true_self": root_lookup.get("true_self"),
+                "root_drives": root_lookup.get("root_drives", [])[:5],
+                "current_objectives": root_lookup.get("current_objectives", [])[:5],
+                "fears": root_lookup.get("fears", [])[:4],
+                "strategies": root_lookup.get("strategies", [])[:5],
+                "trigger_analysis": root_lookup.get("current_trigger_analysis", {}),
+                "action_policy": root_lookup.get("action_policy", {}),
+            },
+            "motivation_runtime": deep_copy(
+                packet.get("motivation_runtime", {})
+                if isinstance(packet, dict)
+                else {}
+            ),
+            "current_runtime_state": deep_copy(
+                packet.get("current_runtime_state", {})
+                if isinstance(packet, dict)
+                else {}
+            ),
+            "capabilities": compact_list(capability_names, 10),
+            "relationships": compact_list(relationships, 6),
+            "evidence_snippets": self._compact_source_snippets(
+                evidence.get("evidence_snippets", []),
+                limit=4,
+                text_limit=240,
+            ),
+            "retrieval_quality": tools.get("retrieval_quality_gate", {}),
+            "recent_visible_events": recent_events,
+            "memory_summary": clean_text(
+                (packet.get("memory", {}) if isinstance(packet, dict) else {}).get(
+                    "summary", ""
+                )
+            )[-500:],
+        }
+
+    def _compact_renderer_system_packet(self, packet):
+        packet = packet if isinstance(packet, dict) else {}
+        retrieval = packet.get("runtime_retrieval", {})
+        return {
+            "runtime_retrieval": {
+                "query": clean_text(retrieval.get("query")),
+                "source_snippets": self._compact_source_snippets(
+                    retrieval.get("source_snippets", []),
+                    limit=4,
+                    text_limit=240,
+                ),
+                "policy": retrieval.get("policy"),
+            },
+            "authority": packet.get("authority"),
+        }
 
     def _renderer_prompt(
         self,
@@ -4746,35 +8542,97 @@ prevented。只输出 JSON。
 3. 不写 JSON、系统解释、成功率、裁定标签、数据汇报或幕后世界变化。
 4. 保持原著角色身份、关系、能力与时代质感，但不要复刻原文句子。
 5. 采用长篇小说的渐进节奏。日常先于异变，细节先于结论，让事件逐步发生。
-6. 开场轮必须处于角色原生的正常生活轨迹，不用突发灾难强行开戏。
-7. 正文目标为 1200-1800 个中文字符，分成自然段，停在一个可继续行动的时刻。
+6. 开场轮必须处于角色本体的正常生活轨迹，不用突发灾难强行开戏；但
+“正常生活”必须服务于本体欲望和长期目标，不能把临时伪装身份写成真实人生。
+7. 正文目标为 700-1100 个中文字符；短对话可为 350-700 个中文字符。
+   分成自然段，停在一个可继续行动的时刻。
    必须一次性完成，不要靠重复段落、换词复述、倒回时间线或重新描写同一动作凑字数。
-8. 非开场轮必须从上一轮最后时刻继续。第一段就落实本轮玩家输入，不得从
-清晨、起床、场景介绍或前一轮开头重新写起，不得复述上一轮已经发生的过程。
-9. 玩家输入是本轮硬约束。即使它违背角色人格，角色也必须实际尝试说出或
-做出该行为；人格冲突只能改变表现方式和后果，不能把指令换成别的行动。
+8. 非开场轮必须从上一轮最后时刻继续。第一段就落实本轮玩家注入念头对
+“我”的影响，不得从清晨、起床、场景介绍或前一轮开头重新写起，不得复述
+上一轮已经发生的过程。
+9. 玩家输入不是外部硬控动作，而是“我”脑中被注入的念头、冲动、怀疑、
+判断或命令。正文必须让读者看见这个念头如何被角色的本体欲望、关系压力、
+恐惧、责任和当前场景消化：可能立刻行动，也可能犹豫、抗拒、找借口、
+改变计划、拖延、试探或被他人压力逼迫。不能因为原著事件本该发生，就把
+这个念头无效化。
 10. 全文语言必须与玩家本轮输入语言一致。
 11. 叙事时间只能向前推进。一个动作、一次开口、一次观察、一次心理判断
 只写一次；写过“某人开口/我调整呼吸/我低头看/我催动能力”后，后文不得
 再回到这个节点重新开始。
 12. 如果素材不足，不要扩写废话；推进到动作后的直接反应、环境变化、
 身体状态或下一个可选行动点。
+13. 如果 viewpoint_character 含有 core_motivation，第一人称内在判断必须
+由 true_self、root_drives、current_true_objectives 和 current_trigger_analysis
+驱动。可以描写伪装的动作和生活细节，但读者必须能感觉到那是为了接近目标、
+掩护本体或规避风险的策略，而不是角色真正的终极目的。
+14. 如果 renderer_rag_packet 或 actor packet 含 root、evidence_snippets
+或 retrieval_quality，优先使用这些压缩证据：证据强时写出清晰欲望与判断；
+证据薄时写出谨慎、试探和不确定，而不是凭空补完整设定。
+15. 如果 viewpoint_actor_packet 含 motivation_runtime，用当前欲望、恐惧和
+伪装压力调节第一人称心理与动作强度；这些是动态状态，不是旁白说明。
+16. 如果 viewpoint_actor_packet 的 action_policy/action_bias 指向
+risk_managed_pursuit，恐惧只能让“我”更隐蔽、更狡猾或更谨慎，不能让整篇
+变成屏息、僵住、扮石头、装死或反复害怕。必须写出至少一个服务核心目的
+的前进行动或明确下一步机会：换身份、试探、诱导、绕开威胁、分散护卫、
+接近目标、布置后手或撤到更有利位置。
+17. 如果 passive_continue 为 true，不要把“继续/观察/下一步”当作正文动作
+反复写出；它表示玩家把主动权交给世界。正文必须推进 NPC、环境、原著压力
+或角色自身目标的下一步，不能只写“我继续等着/我继续看着”。
+18. 原著、长辈命令、组织任务和既定事件只能作为压力写入场景。若 player_intent
+已经显示角色被注入念头后产生拒绝、怀疑或改道，正文要写出这种偏离如何
+发生，以及外界如何施压、劝说或阻拦；不要把角色无条件拉回原著路线。
+19. 只能渲染 npc_public_actions 中的命名角色，以及 local_world.
+ambient_npc_reactions 中的普通路人/村民/侍从/小妖反应。active_scene
+之外的命名角色不得突然出现、发言或继续思考。
+20. 如果 local_world.forced_progress.must_reveal_destination 为 true，说明
+局部世界已经判定连续推进足以抵达目标点。正文必须在本轮直接写到抵达后
+的发现或阻碍：看见目标、发现痕迹、遭遇陷阱、发现空无一物或出现新的
+明确阻碍之一。禁止再以“就在前方、即将揭晓、准备迎接命运、还差一点”
+之类悬置句结束。
 """.strip()
         previous = self._last_visible_narrative()
+        passive_continue = self._is_passive_continue_input(raw_player_input)
+        player_action_text = (
+            "观察并让局势自然推进"
+            if passive_continue
+            else raw_player_input
+        )
         renderer_context = (
             (context or {})
             .get("rag_orchestration", {})
             .get("system_packets", {})
             .get("scene_renderer", context or {})
         )
+        viewpoint_actor_packet = (
+            (context or {})
+            .get("rag_orchestration", {})
+            .get("agent_packets", {})
+            .get(player_profile.get("character_id"), {})
+        )
+        compact_viewpoint = self._compact_renderer_character(player_profile)
+        compact_actor_packet = self._compact_renderer_actor_packet(
+            viewpoint_actor_packet
+        )
+        compact_renderer_context = self._compact_renderer_system_packet(
+            renderer_context
+        )
         user = json.dumps(
             {
                 "mode": "canonical_daily_opening" if opening else "turn_result",
-                "raw_player_input_must_appear_as_action": raw_player_input,
+                "raw_player_input": raw_player_input,
+                "injected_thought": player_intent.get(
+                    "injected_thought", raw_player_input
+                ),
+                "thought_assimilation": player_intent.get(
+                    "thought_assimilation", ""
+                ),
+                "passive_continue": passive_continue,
+                "raw_player_input_must_appear_as_action": player_action_text,
                 "required_output_language": self._response_language(
                     raw_player_input
                 ),
-                "viewpoint_character": player_profile,
+                "viewpoint_character": compact_viewpoint,
+                "viewpoint_actor_packet": compact_actor_packet,
                 "player_intent": player_intent,
                 "npc_public_actions": [
                     {
@@ -4787,28 +8645,38 @@ prevented。只输出 JSON。
                 ],
                 "local_world": local_world,
                 "gm_resolution": resolution,
-                "runtime_retrieval": (context or {}).get(
-                    "runtime_retrieval", {}
-                ),
-                "renderer_rag_packet": renderer_context,
+                "renderer_rag_packet": compact_renderer_context,
                 "elapsed_minutes": elapsed_minutes,
                 "active_scene": self.store.runtime.get("active_scene"),
-                "canonical_event": self.current_canonical_event(),
-                "story_spine": (context or {}).get("story_spine", {}),
+                "canonical_event": self._compact_timeline_anchor(
+                    self.current_canonical_event()
+                ),
+                "story_spine": self._compact_renderer_story_spine(),
                 "render_contract": {
-                    "must_execute_player_input_in_first_paragraph": True,
+                    "must_show_injected_thought_effect_in_first_paragraph": True,
                     "must_continue_from_previous_ending": not opening,
                     "timeline_must_move_forward": True,
+                    "forced_destination_reveal": (
+                        local_world.get("forced_progress", {})
+                        if isinstance(local_world, dict)
+                        else {}
+                    ),
                     "forbidden": [
                         "restart the scene",
                         "repeat earlier paragraphs",
                         "paraphrase the same action to pad length",
                         "let an NPC perform the player's instruction first",
-                        "ignore raw_player_input_must_appear_as_action",
+                        "ignore injected thought when passive_continue is false",
+                        "force canon event to happen after player_intent altered or prevented it",
+                        "repeat passive continue text as the whole turn",
+                        "turn fear into the whole objective",
+                        "remain a stone/statue/still object for the whole turn",
+                        "end without any goal-directed step when action_policy requires pursuit",
+                        "end with only almost-arrival when forced_destination_reveal is active",
                     ],
                     "length_policy": (
-                        "target 1200-1800 Chinese characters in one complete "
-                        "draft; never add length by looping back"
+                        "target 700-1100 Chinese characters, or 350-700 for "
+                        "short dialogue; never add length by looping back"
                     ),
                 },
                 "continuity_anchor": {
@@ -4966,112 +8834,85 @@ prevented。只输出 JSON。
             kept_normalized.append(normalized)
         return "\n\n".join(kept)
 
-    def _rewrite_scene_narrative(
-        self,
-        system,
-        original_payload,
-        reason,
-        current_narrative="",
-        max_tokens=6200,
-    ):
-        return self._call_text(
-            system,
-            json.dumps(
-                {
-                    "instruction": (
-                        "候选正文必须整篇重写，不要续写、不要修补、不要复用"
-                        "候选正文的段落顺序。第一段立即承接 previous_ending_only，"
-                        "落实 raw_player_input_must_appear_as_action。叙事只能向前"
-                        "推进，禁止回到已经写过的节点，禁止用近义改写重复同一"
-                        "动作、台词、观察或心理判断。目标 1200-1800 中文字符；"
-                        "宁可略短，也不要重复凑字。"
-                    ),
-                    "rewrite_reason": reason,
-                    "bad_candidate_excerpt": current_narrative[:2600],
-                    "original_payload": original_payload,
-                },
-                ensure_ascii=False,
-            ),
-            temperature=0.66,
-            max_tokens=max_tokens,
+    @staticmethod
+    def _looks_like_structured_output(text):
+        stripped = str(text or "").strip()
+        if not stripped:
+            return True
+        return (
+            stripped.startswith("{")
+            or stripped.startswith("[")
+            or stripped.startswith("```")
         )
+
+    def _fallback_narrative(
+        self,
+        raw_player_input,
+        player_intent,
+        npc_actions,
+        local_world,
+        resolution,
+    ):
+        passive_continue = self._is_passive_continue_input(raw_player_input)
+        intent = clean_text(player_intent.get("resolved_intent"))
+        if passive_continue:
+            first = (
+                "我暂且不抢先开口，把注意力放回眼前正在变化的局势上。"
+                "这不是停在原地发怔，而是在等旁人的脚步、风声和破绽先露出来。"
+            )
+        else:
+            first = f"我照着心里的决定动了起来：{intent or clean_text(raw_player_input)}。"
+        public_reactions = [
+            clean_text(item.get("visible_behavior") or item.get("dialogue"))
+            for item in npc_actions
+            if clean_text(item.get("visible_behavior") or item.get("dialogue"))
+        ]
+        ambient_reactions = [
+            clean_text(
+                "：".join(
+                    item
+                    for item in [
+                        clean_text(reaction.get("speaker_label")),
+                        clean_text(
+                            reaction.get("dialogue")
+                            or reaction.get("visible_behavior")
+                        ),
+                    ]
+                    if item
+                )
+            )
+            for reaction in local_world.get("ambient_npc_reactions", [])
+            if isinstance(reaction, dict)
+            and clean_text(
+                reaction.get("dialogue") or reaction.get("visible_behavior")
+            )
+        ]
+        world_notes = [
+            clean_text(item)
+            for key in ("new_events", "world_changes", "object_updates")
+            for item in local_world.get(key, [])
+            if clean_text(item)
+        ]
+        consequences = [
+            clean_text(item)
+            for item in resolution.get("consequences", [])
+            if clean_text(item)
+        ]
+        details = (
+            public_reactions[:2]
+            + ambient_reactions[:2]
+            + world_notes[:2]
+            + consequences[:2]
+        )
+        if details:
+            second = "；".join(details)
+        else:
+            second = "四周的声息没有停下，场景仍在向下一步逼近。"
+        return f"{first}\n\n{second}"
 
     def _scene_renderer(self, *args, **kwargs):
         system, user = self._renderer_prompt(*args, **kwargs)
         narrative = self._call_text(system, user)
-        opening = bool(kwargs.get("opening", False))
-        previous = self._last_visible_narrative()
-        if not opening and previous:
-            common_prefix = 0
-            for left, right in zip(previous, narrative):
-                if left != right:
-                    break
-                common_prefix += 1
-            if common_prefix >= 120:
-                narrative = self._rewrite_scene_narrative(
-                    system,
-                    user,
-                    "candidate_restarts_previous_turn",
-                    narrative,
-                )
-        if not opening:
-            raw_player_input = (
-                args[1]
-                if len(args) > 1
-                else kwargs.get("raw_player_input", "")
-            )
-            guard = self._call_json(
-                """
-你是小说回合验收器。判断候选正文是否满足：
-1. 前三段内由第一人称“我”实际执行或说出本轮玩家输入，而不是其他 NPC
-抢先代做；2. 没有从上一轮开头重写；3. 没有把玩家指令换成别的行动；
-4. 语言与玩家输入一致。只输出 JSON。
-""".strip(),
-                json.dumps(
-                    {
-                        "player_input": raw_player_input,
-                        "previous_ending": previous[-700:],
-                        "candidate_opening": narrative[:1600],
-                        "output_schema": {
-                            "passed": True,
-                            "player_action_visible_early": True,
-                            "npc_stole_player_action": False,
-                            "restarts_previous_scene": False,
-                            "language_matches": True,
-                            "reason": "",
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-                max_tokens=500,
-            )
-            if not guard.get("passed"):
-                narrative = self._rewrite_scene_narrative(
-                    system,
-                    user,
-                    {"guard_failed": guard},
-                    narrative,
-                )
-        for attempt in range(2):
-            repeat_report = self._narrative_repeat_report(narrative)
-            too_short = (
-                self.min_narrative_chars
-                and len(narrative) < self.min_narrative_chars
-            )
-            if not repeat_report["has_repeat"] and not too_short:
-                break
-            narrative = self._rewrite_scene_narrative(
-                system,
-                user,
-                {
-                    "repeat_report": repeat_report,
-                    "too_short": too_short,
-                    "current_character_count": len(narrative),
-                    "target_character_count": self.min_narrative_chars,
-                    "rule": "rewrite_once; do not append continuation",
-                },
-                narrative,
-            )
         narrative = self._dedupe_repeated_paragraphs(narrative)
         narrative = self._dedupe_adjacent_paragraphs(narrative)
         return narrative
@@ -5124,13 +8965,45 @@ prevented。只输出 JSON。
         npc_actions,
         local_world,
         resolution,
+        raw_user_input="",
+        context=None,
+        event_id="",
     ):
-        def meaningful_state_update(character_id, value):
+        def meaningful_state_update(character_id, value, actor_action=None):
             if not isinstance(value, dict):
                 return {}
             result = {}
+            action_text = self._action_text_for_follow_check(actor_action or {})
+            allow_body_update = (
+                character_id == player_id
+                or any(
+                    term in action_text
+                    for term in (
+                        "变身",
+                        "变化",
+                        "伪装",
+                        "更衣",
+                        "换装",
+                        "受伤",
+                        "中毒",
+                        "治疗",
+                    )
+                )
+            )
             for key, item in value.items():
                 if item in (None, "", [], {}):
+                    continue
+                if (
+                    character_id != player_id
+                    and key
+                    in {
+                        "clothing",
+                        "physical_state",
+                        "active_effects",
+                        "physiology",
+                    }
+                    and not allow_body_update
+                ):
                     continue
                 if key == "health" and isinstance(item, dict):
                     previous = self.store.runtime.get(
@@ -5195,7 +9068,8 @@ prevented。只输出 JSON。
         for item in npc_actions:
             agent_update = meaningful_state_update(
                 item["character_id"],
-                item.get("self_state_update")
+                item.get("self_state_update"),
+                item,
             )
             character_updates[item["character_id"]] = {
                 "current_activity": item.get(
@@ -5215,8 +9089,192 @@ prevented。只输出 JSON。
             }
         character_updates[player_id] = meaningful_state_update(
             player_id,
-            player_intent.get("self_state_update")
+            player_intent.get("self_state_update"),
         )
+        stored_scene = self.store.runtime.get("active_scene") or {}
+        scene = (context or {}).get("scene") or stored_scene
+        previous_scene_location = clean_text(
+            stored_scene.get("location_id") or scene.get("location_id")
+        )
+        player_location = self._location_record_from_turn_outputs(
+            player_id,
+            player_intent=player_intent,
+            local_world=local_world,
+            resolution=resolution,
+            raw_user_input=raw_user_input,
+            scene_location_id=previous_scene_location,
+        )
+        player_location_id = clean_text(player_location.get("location_id"))
+        previous_player_location = (
+            self._character_current_location(player_id)
+            or previous_scene_location
+        )
+        if player_location_id:
+            character_updates.setdefault(player_id, {})
+            character_updates[player_id].update(
+                {
+                    "current_location": player_location_id,
+                    "availability": "player_controlled",
+                }
+            )
+
+        promoted_current_ambient_ids = []
+        direct_interaction_terms = {
+            "问",
+            "说",
+            "聊",
+            "威胁",
+            "逼问",
+            "质问",
+            "审问",
+            "咨询",
+            "追问",
+            "恐吓",
+            "拦",
+        }
+        direct_interaction = any(
+            term in self._turn_text(
+                raw_user_input,
+                player_intent.get("resolved_intent", ""),
+                player_intent.get("thought_assimilation", ""),
+            )
+            for term in direct_interaction_terms
+        )
+        for reaction in local_world.get("ambient_npc_reactions", []) or []:
+            if not isinstance(reaction, dict):
+                continue
+            if reaction.get("is_group") or reaction.get("source") == "group_controller":
+                continue
+            label = clean_text(reaction.get("speaker_label"))
+            if not label or not direct_interaction:
+                continue
+            character_id = self._ensure_runtime_npc(
+                label,
+                player_location_id,
+                memory_text=self._ambient_reaction_text(reaction),
+                seed_event_id=event_id,
+            )
+            promoted_current_ambient_ids.append(character_id)
+            character_updates.setdefault(character_id, {})
+            character_updates[character_id].update(
+                {
+                    "current_location": player_location_id,
+                    "current_activity": clean_text(
+                        reaction.get("visible_behavior")
+                    ) or "正在与玩家角色对话",
+                    "availability": "active_nearby_npc",
+                    "short_term_goal": "在当前对话或威胁下回应并保全自身",
+                }
+            )
+
+        explicit_follow_ids = {
+            item["character_id"]
+            for item in npc_actions
+            if item.get("character_id")
+            and self._npc_explicitly_stays_with_player(item, raw_user_input)
+        }
+        local_position_updates = {}
+        for update in local_world.get("npc_position_updates", []) or []:
+            if not isinstance(update, dict):
+                continue
+            character_id = clean_text(
+                update.get("character_id")
+                or update.get("entity_id")
+                or update.get("actor_id")
+            )
+            if not self._is_known_character_id(character_id):
+                continue
+            movement_text = self._turn_text(
+                update.get("movement_description", ""),
+                update.get("movement_type", ""),
+                raw_user_input,
+            )
+            candidate_id = clean_text(
+                update.get("new_location_id")
+                or update.get("location_id")
+                or update.get("destination_location_id")
+            )
+            normalized = self._normalize_location_for_turn(
+                candidate_id,
+                movement_text,
+                previous_player_location,
+            )
+            local_position_updates[character_id] = normalized
+        for character_id, location in local_position_updates.items():
+            if character_id == player_id:
+                continue
+            if (
+                clean_text(location.get("location_id")) == player_location_id
+                and character_id in explicit_follow_ids
+            ):
+                character_updates.setdefault(character_id, {})
+                character_updates[character_id].update(
+                    {
+                        "current_location": player_location_id,
+                        "availability": "active_nearby_npc",
+                    }
+                )
+
+        moved_to_new_local_scene = bool(
+            player_location_id
+            and previous_scene_location
+            and player_location_id != previous_scene_location
+        )
+        if moved_to_new_local_scene:
+            for character_id in stored_scene.get("participant_ids", []):
+                if character_id == player_id or character_id in explicit_follow_ids:
+                    continue
+                if not self._is_known_character_id(character_id):
+                    continue
+                character_updates.setdefault(character_id, {})
+                character_updates[character_id].update(
+                    {
+                        "availability": "dormant",
+                        "current_activity": (
+                            "留在原地点，暂时退出当前局部场景。"
+                        ),
+                        "attention_target": "",
+                    }
+                )
+        actor_packets = (
+            (context or {})
+            .get("rag_orchestration", {})
+            .get("agent_packets", {})
+        )
+        motivation_updates = {}
+        actor_actions = [
+            (
+                player_id,
+                {
+                    "resolved_intent": player_intent.get("resolved_intent"),
+                    "goal": player_intent.get("resolved_intent"),
+                    "emotion": player_intent.get("emotion", ""),
+                    "action_intent": {
+                        "description": player_intent.get("resolved_intent", ""),
+                    },
+                },
+            ),
+            *[
+                (item["character_id"], item)
+                for item in npc_actions
+                if item.get("character_id")
+            ],
+        ]
+        for actor_id, actor_action in actor_actions:
+            if actor_id not in self.character_by_id:
+                continue
+            profile = self._dynamic_profile(actor_id)
+            update = self._motivation_delta_for_actor(
+                profile,
+                actor_action,
+                resolution,
+                actor_packets.get(actor_id, {}),
+            )
+            update["last_updated_by_event_id"] = clean_text(event_id)
+            for history_item in update.get("history", []):
+                if not history_item.get("event_id"):
+                    history_item["event_id"] = clean_text(event_id)
+            motivation_updates[actor_id] = update
         branch_records = deep_copy(
             self.store.runtime.get("branch_records", [])
         )
@@ -5259,21 +9317,87 @@ prevented。只输出 JSON。
                     "created_at": utc_now(),
                 }
             )
-        scene = self.store.runtime.get("active_scene") or {}
-        location_id = scene.get("location_id")
+        active_participant_ids = [player_id, *promoted_current_ambient_ids]
+        for item in npc_actions:
+            character_id = clean_text(item.get("character_id"))
+            if not character_id or not self._is_known_character_id(character_id):
+                continue
+            if moved_to_new_local_scene and character_id not in explicit_follow_ids:
+                continue
+            character_location = character_updates.get(character_id, {}).get(
+                "current_location"
+            ) or self._character_current_location(character_id)
+            if player_location_id and character_location == player_location_id:
+                active_participant_ids.append(character_id)
+            elif not moved_to_new_local_scene:
+                active_participant_ids.append(character_id)
+        active_participant_ids = compact_list(active_participant_ids, self.max_nearby_agents + 1)
+        next_scene = deep_copy(scene)
+        if player_location_id:
+            next_scene["location_id"] = player_location_id
+            next_scene["location_name"] = player_location.get("location_name", "")
+        next_scene["turn"] = bounded_int(
+            scene.get("turn"),
+            default=0,
+            minimum=0,
+        ) + 1
+        next_scene["participant_ids"] = active_participant_ids
+        scene_transition = local_world.get("scene_transition", {})
+        if not isinstance(scene_transition, dict):
+            scene_transition = {}
+        if scene_transition.get("summary"):
+            next_scene["summary"] = clean_text(
+                scene_transition.get("summary")
+            )
+
+        location_id = player_location_id or scene.get("location_id")
         location_updates = {}
         if location_id:
             sensory = local_world.get("sensory_environment", {})
             location_updates[location_id] = {
                 "location_id": location_id,
+                "location_name": player_location.get("location_name", ""),
                 **deep_copy(RUNTIME_LOCATION_DEFAULTS),
                 **sensory,
-                "present_characters": scene.get("participant_ids", []),
+                "present_characters": active_participant_ids,
                 "ongoing_events": local_world.get("new_events", []),
             }
+        group_runtime_updates = {}
+        group_controller = local_world.get("group_controller", {})
+        if isinstance(group_controller, dict):
+            for group in group_controller.get("groups", []) or []:
+                if not isinstance(group, dict):
+                    continue
+                group_id = clean_text(group.get("group_id"))
+                if not group_id:
+                    continue
+                state_update = group.get("state_update", {})
+                if not isinstance(state_update, dict):
+                    state_update = {}
+                group_runtime_updates[group_id] = {
+                    "group_id": group_id,
+                    "label": clean_text(group.get("label")),
+                    "group_type": clean_text(group.get("group_type")),
+                    "current_location": clean_text(group.get("location_id"))
+                    or location_id,
+                    "mood": clean_text(group.get("mood")),
+                    "goal": clean_text(group.get("goal")),
+                    "current_activity": clean_text(
+                        state_update.get("current_activity")
+                        or group.get("visible_behavior")
+                    ),
+                    "last_pressure": clean_text(
+                        state_update.get("last_pressure")
+                        or group.get("pressure")
+                    ),
+                    "last_updated_by_event_id": clean_text(event_id),
+                }
         return {
             "character_runtime": character_updates,
+            "motivation_runtime": motivation_updates,
+            "group_runtime": group_runtime_updates,
             "location_runtime": location_updates,
+            "active_scene": next_scene,
             "active_events": local_world.get("new_events", []),
             "timeline_cursor": self._next_timeline_cursor(resolution),
             "narrative_spine": self._narrative_spine_update(resolution),
@@ -5283,6 +9407,88 @@ prevented。只输出 JSON。
                 local_world.get("encyclopedia_updates", []),
             ),
         }
+
+    @staticmethod
+    def _normalize_state_changes_for_commit(changes):
+        normalized = []
+        for item in changes or []:
+            if not isinstance(item, dict):
+                continue
+            subject_id = clean_text(
+                item.get("subject_id")
+                or item.get("target_id")
+                or item.get("entity_id")
+            )
+            field = clean_text(
+                item.get("field")
+                or item.get("property")
+                or item.get("change_type")
+            )
+            if (
+                field
+                and field not in GENERIC_EVENT_FIELDS
+                and not field.startswith(("state.", "custom."))
+            ):
+                field = f"state.{field}"
+            if "after" in item:
+                after = item.get("after")
+            elif "new_value" in item:
+                after = item.get("new_value")
+            elif "description" in item:
+                after = item.get("description")
+            else:
+                after = item
+            if not subject_id or not field:
+                continue
+            normalized.append(
+                {
+                    "subject_id": subject_id,
+                    "field": field,
+                    "after": deep_copy(after),
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _intent_implies_canon_divergence(player_intent):
+        action_type = clean_text(player_intent.get("action_type")).lower()
+        text = clean_text(
+            "；".join(
+                [
+                    player_intent.get("injected_thought", ""),
+                    player_intent.get("thought_assimilation", ""),
+                    player_intent.get("resolved_intent", ""),
+                    player_intent.get("conflict_reason", ""),
+                ]
+            )
+        )
+        if action_type in {
+            "internal_doubt",
+            "refusal",
+            "resistance",
+            "avoidance",
+            "change_plan",
+            "reject_order",
+        }:
+            return True
+        divergence_terms = {
+            "不好吃",
+            "不值得",
+            "性价比",
+            "不要去",
+            "不去",
+            "拒绝",
+            "放弃",
+            "暂缓",
+            "推迟",
+            "改道",
+            "不再",
+            "反对",
+            "怀疑",
+            "动摇",
+            "重新评估",
+        }
+        return any(term in text for term in divergence_terms)
 
     def start_character_experience(
         self, character_id, progress_percent=None, progress_callback=None
@@ -5306,10 +9512,16 @@ prevented。只输出 JSON。
         cutoff_state_db, cutoff_runtime_db = self._cutoff_databases(order)
         cutoff_world_state = cutoff_state_db.get("current_world_state", {})
         cutoff_resource_states = cutoff_world_state.get("resource_states", {})
+        anchor_location_id = clean_text(anchor.get("location_id"))
+        nearby_seed = anchor.get("participants", []) if anchor_location_id else []
         nearby = compact_list(
             [
-                *anchor.get("participants", []),
-                *self._opening_cast(character_id, order),
+                *nearby_seed,
+                *(
+                    self._opening_cast(character_id, order)
+                    if anchor_location_id
+                    else []
+                ),
             ],
             self.max_nearby_agents,
         )
@@ -5318,9 +9530,7 @@ prevented。只输出 JSON。
             for item in nearby
             if item != character_id and item in self.character_by_id
         ]
-        location_id = (
-            anchor.get("location_id") or self._nearest_location(order)
-        )
+        location_id = anchor_location_id or self._nearest_location(order)
         summary = (
             f"原著阶段：{anchor.get('event', '日常生活')}。"
             "从角色正常生活轨迹开始，原著事件作为可改变的未来压力继续存在。"
@@ -5354,6 +9564,14 @@ prevented。只输出 JSON。
         initial_character_runtime[character_id][
             "current_activity"
         ] = "沿着原著日常轨迹生活"
+        initial_motivation_runtime = {}
+        for item in [character_id, *nearby]:
+            profile = self._dynamic_profile(item)
+            root_lookup = self._character_root_lookup(profile)
+            initial_motivation_runtime[item] = self._baseline_motivation_runtime(
+                profile,
+                root_lookup,
+            )
         init_event = {
             "event_id": "event_" + uuid.uuid4().hex[:16],
             "idempotency_key": (
@@ -5379,6 +9597,7 @@ prevented。只输出 JSON。
                     "active_events",
                     "runtime_event_db",
                     "runtime_event_queue",
+                    "motivation_runtime",
                 ],
                 "entity_states": cutoff_world_state.get("entity_states", {}),
                 "resource_states": cutoff_resource_states,
@@ -5392,6 +9611,7 @@ prevented。只输出 JSON。
                 "canonical_timeline": deep_copy(self.canonical_timeline),
                 "timeline_cursor": timeline_index,
                 "character_runtime": initial_character_runtime,
+                "motivation_runtime": initial_motivation_runtime,
                 "world_knowledge_cache": self._world_cache_updates(
                     [character_id, *nearby]
                 ),
@@ -5406,7 +9626,7 @@ prevented。只输出 JSON。
         self.store.commit_event(init_event, validation)
         self._progress(progress_callback, 42, "建立角色与世界状态栏")
         profile = self._dynamic_profile(character_id)
-        opening_input = "继续此刻原本正在进行的日常生活"
+        opening_input = "从角色本体目标驱动的当前正常生活轨迹继续"
         opening_context = self.build_context_packet(
             opening_input,
             [
@@ -5423,6 +9643,8 @@ prevented。只输出 JSON。
             "npc_position_updates": [],
             "object_updates": [],
             "new_events": [anchor.get("event", "原著日常")],
+            "scene_transition": {},
+            "ambient_npc_reactions": [],
             "sensory_environment": {},
         }
         self._progress(progress_callback, 58, "角色正在进入日常生活")
@@ -5481,42 +9703,131 @@ prevented。只输出 JSON。
         }
 
     def run_turn(self, user_input, progress_callback=None):
+        turn_started = time.perf_counter()
+        stage_seconds = {}
         scene = self.store.runtime.get("active_scene")
         if not scene:
             raise RuntimeError("Start a character experience first.")
         player_id = clean_text(scene.get("focus_character_id"))
         player_profile = self._dynamic_profile(player_id)
-        nearby_ids = [
-            item
-            for item in scene.get("participant_ids", [])
-            if item != player_id
-        ][: self.max_nearby_agents]
+        pre_location = self._location_record_from_turn_outputs(
+            player_id,
+            raw_user_input=user_input,
+            scene_location_id=scene.get("location_id", ""),
+        )
+        turn_scene = self._scene_with_effective_location(scene, pre_location)
+        promoted_ambient_ids = self._promote_referenced_ambient_npcs(
+            user_input,
+            player_id,
+            turn_scene,
+        )
+        nearby_ids = self._active_nearby_character_ids(
+            user_input,
+            player_id,
+            scene,
+            turn_scene.get("location_id", ""),
+        )
+        turn_scene["participant_ids"] = [player_id, *nearby_ids]
         profiles = [self._dynamic_profile(item) for item in nearby_ids]
+        stage_started = time.perf_counter()
         context = self.build_context_packet(
-            user_input, [player_profile, *profiles]
+            user_input,
+            [player_profile, *profiles],
+            scene_override=turn_scene,
         )
-        self._progress(progress_callback, 8, "角色正在理解你的行动")
-        player_intent = self._player_controller(
-            player_profile, user_input, context
+        stage_seconds["context_packet"] = round(
+            time.perf_counter() - stage_started,
+            3,
         )
-        self._progress(progress_callback, 18, "时间 Agent 正在估算经过时间")
-        time_result = self._time_agent(player_intent, user_input)
+
+        self._progress(progress_callback, 10, "玩家角色正在消化注入念头")
+        stage_started = time.perf_counter()
+        try:
+            player_intent = self._player_controller(
+                player_profile,
+                user_input,
+                context,
+            )
+        except Exception:
+            player_intent = self._fallback_turn_plan(
+                player_profile,
+                profiles,
+                user_input,
+            )["player_intent"]
+        player_intent["character_id"] = player_id
+        player_intent["injected_thought"] = (
+            clean_text(player_intent.get("injected_thought"))
+            or clean_text(user_input)
+        )
+        player_intent["thought_assimilation"] = clean_text(
+            player_intent.get("thought_assimilation")
+        ) or "这个念头进入角色脑中，并被当前动机与处境转化为短期倾向。"
+        player_intent["resolved_intent"] = (
+            clean_text(player_intent.get("resolved_intent"))
+            or clean_text(user_input)
+            or "观察并让局势自然推进"
+        )
+        player_intent["action_type"] = (
+            clean_text(player_intent.get("action_type"))
+            or "minor_action"
+        )
+        player_intent["impact_level"] = (
+            clean_text(player_intent.get("impact_level"))
+            or "minor_action"
+        )
+        if not isinstance(player_intent.get("self_state_update"), dict):
+            player_intent["self_state_update"] = {}
+        stage_seconds["player_controller_llm"] = round(
+            time.perf_counter() - stage_started,
+            3,
+        )
+
+        self._progress(progress_callback, 20, "时间服务正在估算本轮耗时")
+        stage_started = time.perf_counter()
+        time_result = self._time_service(player_intent, user_input)
+        stage_seconds["time_service"] = round(
+            time.perf_counter() - stage_started,
+            3,
+        )
+        stage_seconds["time_agent_llm"] = 0.0
         elapsed_minutes = bounded_int(
             time_result.get("elapsed_minutes"),
             default=0,
             minimum=0,
         )
+        if self._is_passive_continue_input(user_input) and elapsed_minutes < 1:
+            elapsed_minutes = 5
+        time_result["elapsed_minutes"] = elapsed_minutes
+        time_result["triggers_global_update"] = bool(
+            time_result.get("triggers_global_update")
+        )
+
+        wake_plan = self._agent_wake_plan(
+            user_input,
+            player_intent,
+            profiles,
+            elapsed_minutes,
+            scene=turn_scene,
+        )
+        active_profile_ids = set(wake_plan.get("selected_npc_ids", []))
+        active_profiles = [
+            profile
+            for profile in profiles
+            if profile["character_id"] in active_profile_ids
+        ]
+
         npc_actions = []
-        validations = []
-        for profile in profiles:
-            completed = len(npc_actions)
-            self._progress(
-                progress_callback,
-                25 + round(
-                    28 * completed / max(1, len(profiles))
-                ),
-                f"{profile['canonical_name']} 正在观察并行动",
-            )
+        self._progress(progress_callback, 28, "Agent 调度器正在唤醒相关附近角色")
+        stage_started = time.perf_counter()
+        for index, profile in enumerate(active_profiles):
+            name = profile.get("canonical_name", "附近角色")
+            if active_profiles:
+                progress = 28 + round((index + 1) * 17 / len(active_profiles))
+                self._progress(
+                    progress_callback,
+                    progress,
+                    f"{name} 正在依据自身目标思考",
+                )
             try:
                 proposal = self._nearby_npc_action(
                     profile,
@@ -5529,24 +9840,131 @@ prevented。只输出 JSON。
                     profile,
                     {
                         "dialogue": "",
-                        "visible_behavior": "继续原本的活动",
                         "action_intent": {
-                            "action_type": "continue_activity",
-                            "description": "继续原本的活动并留意周围",
+                            "action_type": "wait",
+                            "description": "保持观察",
                             "impact_level": "minor_action",
+                            "target_concept_ids": [],
+                            "proposed_state_changes": [],
                         },
+                        "concept_refs": [],
+                        "claims": [],
                         "private_reasoning_summary": clean_text(error),
                     },
                 ) | {
                     "perception": "",
                     "emotion": "",
-                    "goal": "",
-                    "visible_behavior": "继续原本的活动",
+                    "goal": "保持观察",
+                    "visible_behavior": "保持观察",
+                    "self_state_update": {},
                 }
+            npc_actions.append(proposal)
+        skipped_npc_actions = [
+            {
+                "character_id": profile["character_id"],
+                "canonical_name": profile.get("canonical_name"),
+                "status": "sleeping",
+                "reason": "本轮调度器判定无直接感知变化、无点名、低影响且无需独立思考。",
+            }
+            for profile in profiles
+            if profile["character_id"] not in active_profile_ids
+        ]
+        stage_seconds["nearby_npc_agents_llm"] = round(
+            time.perf_counter() - stage_started,
+            3,
+        )
+        npc_requires_world_or_gm = any(
+            self._impact_rank(
+                item.get("action_intent", {}).get("impact_level")
+            )
+            >= 2
+            or bool(
+                item.get("action_intent", {}).get(
+                    "proposed_state_changes", []
+                )
+            )
+            for item in npc_actions
+        )
+
+        should_run_group_controller = bool(
+            wake_plan.get("should_run_group_controller")
+        )
+        if should_run_group_controller:
+            self._progress(progress_callback, 47, "Group Controller 正在统一模拟附近群体")
+            stage_started = time.perf_counter()
+            group_controller = self._group_controller_agent(
+                user_input,
+                player_intent,
+                npc_actions,
+                elapsed_minutes,
+                context,
+            )
+            stage_seconds["group_controller"] = round(
+                time.perf_counter() - stage_started,
+                3,
+            )
+        else:
+            group_controller = {
+                "ran": False,
+                "policy": "lazy_group_controller",
+                "resource_mode": "deterministic_no_llm",
+                "groups": [],
+                "reason": "调度器未检测到需要统一模拟的群体。",
+            }
+            stage_seconds["group_controller"] = 0.0
+
+        self._progress(progress_callback, 50, "规则检查 Agent 正在校验动作边界")
+        stage_started = time.perf_counter()
+        validations = []
+        actor_packet = (
+            context.get("rag_orchestration", {})
+            .get("agent_packets", {})
+            .get(player_id, {})
+        )
+        player_rag_ids = [
+            item.get("entity_id") or item.get("concept_id")
+            for item in [
+                *actor_packet.get("trusted_knowledge", []),
+                *actor_packet.get("supported_knowledge", []),
+            ]
+            if item.get("entity_id") or item.get("concept_id")
+        ]
+        player_proposal = {
+            "agent_id": player_profile.get("agent_id", player_id),
+            "character_id": player_id,
+            "canonical_name": player_profile.get("canonical_name"),
+            "dialogue": "",
+            "action_intent": {
+                "action_type": clean_text(player_intent.get("action_type")) or "minor_action",
+                "description": player_intent["resolved_intent"],
+                "impact_level": clean_text(player_intent.get("impact_level")) or "minor_action",
+                "target_concept_ids": [
+                    clean_text(item)
+                    for item in player_intent.get("target_concept_ids", [])
+                    if clean_text(item)
+                ],
+                "ability_concept_id": "",
+                "artifact_concept_id": "",
+                "candidate_rule_ids": [],
+                "proposed_state_changes": [],
+            },
+            "concept_refs": [],
+            "claims": [],
+            "private_reasoning_summary": player_intent.get("thought_assimilation", ""),
+        }
+        validations.append(
+            self.validator.validate(
+                player_proposal,
+                player_id,
+                self.store,
+                player_rag_ids,
+            )
+        )
+        for proposal in npc_actions:
             actor_packet = (
                 context.get("rag_orchestration", {})
                 .get("agent_packets", {})
-                .get(profile["character_id"], {})
+                .get(proposal["character_id"], {})
             )
             actor_rag_ids = [
                 item.get("entity_id") or item.get("concept_id")
@@ -5558,27 +9976,180 @@ prevented。只输出 JSON。
             ]
             validation = self.validator.validate(
                 proposal,
-                profile["character_id"],
+                proposal["character_id"],
                 self.store,
                 actor_rag_ids,
             )
-            npc_actions.append(proposal)
             validations.append(validation)
-        self._progress(progress_callback, 55, "局部世界正在推进环境与事件")
-        local_world = self._local_world_agent(
+        stage_seconds["rules_agent_validation"] = round(
+            time.perf_counter() - stage_started,
+            3,
+        )
+
+        should_run_local_world = bool(
+            wake_plan.get("should_run_local_world")
+            or npc_requires_world_or_gm
+            or self._group_controller_ran(group_controller)
+        )
+        if should_run_local_world:
+            self._progress(progress_callback, 58, "局部世界 Agent 正在更新现场")
+            stage_started = time.perf_counter()
+            try:
+                local_world = self._local_world_agent(
+                    player_intent,
+                    npc_actions,
+                    group_controller,
+                    elapsed_minutes,
+                    context,
+                )
+            except Exception:
+                local_world = {
+                    "world_changes": [],
+                    "npc_position_updates": [],
+                    "object_updates": [],
+                    "new_events": [],
+                    "scene_transition": {},
+                    "ambient_npc_reactions": [],
+                    "sensory_environment": {},
+                    "encyclopedia_updates": [],
+                }
+            stage_seconds["local_world_agent_llm"] = round(
+                time.perf_counter() - stage_started,
+                3,
+            )
+        else:
+            local_world = {
+                "world_changes": [],
+                "npc_position_updates": [],
+                "object_updates": [],
+                "new_events": [],
+                "scene_transition": {},
+                "ambient_npc_reactions": [],
+                "sensory_environment": {},
+                "encyclopedia_updates": [],
+            }
+            stage_seconds["local_world_agent_llm"] = 0.0
+        for key, default in (
+            ("world_changes", []),
+            ("npc_position_updates", []),
+            ("object_updates", []),
+            ("new_events", []),
+            ("scene_transition", {}),
+            ("ambient_npc_reactions", []),
+            ("sensory_environment", {}),
+            ("encyclopedia_updates", []),
+        ):
+            local_world.setdefault(key, default)
+        if not isinstance(local_world.get("scene_transition"), dict):
+            local_world["scene_transition"] = {}
+        if not isinstance(local_world.get("ambient_npc_reactions"), list):
+            local_world["ambient_npc_reactions"] = []
+        local_world = self._merge_group_controller_into_local_world(
+            local_world,
+            group_controller,
+        )
+        local_world = self._apply_local_world_autonomy(
+            local_world,
             player_intent,
-            npc_actions,
             elapsed_minutes,
             context,
         )
-        self._progress(progress_callback, 68, "GM 正在裁定行动结果")
-        resolution = self._gm_resolver(
-            player_intent,
-            npc_actions,
-            validations,
-            local_world,
-            context,
+
+        should_run_gm = bool(
+            wake_plan.get("should_run_gm")
+            or npc_requires_world_or_gm
+            or self._group_controller_ran(group_controller)
         )
+        if should_run_gm:
+            self._progress(progress_callback, 66, "世界主持人正在裁定本轮结果")
+            stage_started = time.perf_counter()
+            try:
+                resolution = self._gm_resolver(
+                    player_intent,
+                    npc_actions,
+                    validations,
+                    local_world,
+                    context,
+                )
+            except Exception:
+                resolution = {
+                    "success": True,
+                    "outcome": "deferred",
+                    "consequences": [],
+                    "state_changes": [],
+                    "resolved_actions": [],
+                    "player_action_addressed": True,
+                    "impact_level": player_intent.get("impact_level", "minor_action"),
+                    "diverges_from_canon": False,
+                    "divergence_reason": "",
+                    "canonical_event_status": "unchanged",
+                }
+            stage_seconds["gm_resolver_llm"] = round(
+                time.perf_counter() - stage_started,
+                3,
+            )
+        else:
+            resolution = {
+                "success": True,
+                "outcome": "success",
+                "consequences": [],
+                "state_changes": [],
+                "resolved_actions": [
+                    {
+                        "actor_id": player_id,
+                        "description": player_intent["resolved_intent"],
+                        "outcome": "success",
+                        "state_changes": [],
+                    }
+                ],
+                "player_action_addressed": True,
+                "impact_level": player_intent.get("impact_level", "minor_action"),
+                "diverges_from_canon": False,
+                "divergence_reason": "",
+                "canonical_event_status": "unchanged",
+            }
+            stage_seconds["gm_resolver_llm"] = 0.0
+        if not isinstance(resolution, dict):
+            resolution = {}
+        resolution.setdefault("outcome", "deferred")
+        resolution.setdefault("consequences", [])
+        resolution.setdefault("state_changes", [])
+        resolution.setdefault("resolved_actions", [])
+        resolution.setdefault("player_action_addressed", True)
+        resolution.setdefault("impact_level", player_intent.get("impact_level", "minor_action"))
+        resolution.setdefault("diverges_from_canon", False)
+        resolution.setdefault("divergence_reason", "")
+        resolution.setdefault("canonical_event_status", "unchanged")
+        resolution["state_changes"] = self._normalize_state_changes_for_commit(
+            resolution.get("state_changes", [])
+        )
+        if (
+            not resolution.get("diverges_from_canon")
+            and self._intent_implies_canon_divergence(player_intent)
+            and clean_text(resolution.get("outcome")).lower()
+            not in {"failed", "blocked"}
+        ):
+            resolution["diverges_from_canon"] = True
+            resolution["canonical_event_status"] = "altered"
+            resolution["divergence_reason"] = (
+                clean_text(resolution.get("divergence_reason"))
+                or "玩家注入念头改变了角色对当前原著压力的判断。"
+            )
+        if (
+            bool(resolution.get("diverges_from_canon"))
+            and clean_text(resolution.get("canonical_event_status")).lower()
+            == "advanced"
+        ):
+            resolution["canonical_event_status"] = "altered"
+
+        self._progress(progress_callback, 72, "事件调度 Agent 正在整理原著压力")
+        stage_started = time.perf_counter()
+        event_scheduler = self._narrative_spine_update(resolution)
+        stage_seconds["event_scheduler"] = round(
+            time.perf_counter() - stage_started,
+            3,
+        )
+
         resolved_actions = [
             item
             for item in resolution.get("resolved_actions", [])
@@ -5601,7 +10172,9 @@ prevented。只输出 JSON。
             )
         resolution["resolved_actions"] = resolved_actions
         resolution["player_action_addressed"] = True
-        self._progress(progress_callback, 78, "场景 Renderer 正在写作本轮小说")
+
+        self._progress(progress_callback, 78, "叙事 Agent 正在写成本轮正文")
+        stage_started = time.perf_counter()
         narrative = self._scene_renderer(
             player_profile,
             user_input,
@@ -5610,15 +10183,47 @@ prevented。只输出 JSON。
             local_world,
             resolution,
             elapsed_minutes,
-            context,
+            context=context,
+        )
+        narrative = self._dedupe_repeated_paragraphs(narrative)
+        narrative = self._dedupe_adjacent_paragraphs(narrative)
+        if self._looks_like_structured_output(narrative):
+            narrative = self._fallback_narrative(
+                user_input,
+                player_intent,
+                npc_actions,
+                local_world,
+                resolution,
+            )
+        stage_seconds["scene_renderer_llm"] = round(
+            time.perf_counter() - stage_started,
+            3,
         )
         state_changes = [
             item
             for item in resolution.get("state_changes", [])
             if isinstance(item, dict)
         ]
+        event_id = "event_" + uuid.uuid4().hex[:16]
+        runtime_updates = self._runtime_updates(
+            player_id,
+            player_intent,
+            npc_actions,
+            local_world,
+            resolution,
+            raw_user_input=user_input,
+            context=context,
+            event_id=event_id,
+        )
+        committed_participants = compact_list(
+            (
+                runtime_updates.get("active_scene", {}).get("participant_ids")
+                or [player_id, *nearby_ids]
+            ),
+            self.max_nearby_agents + 1,
+        )
         event = {
-            "event_id": "event_" + uuid.uuid4().hex[:16],
+            "event_id": event_id,
             "idempotency_key": stable_hash(
                 {
                     "branch": self.store.branch["branch_id"],
@@ -5632,8 +10237,8 @@ prevented。只输出 JSON。
                 resolution.get("impact_level")
             ) or "minor_action",
             "status": "completed",
-            "participants": [player_id, *nearby_ids],
-            "visible_to": [player_id, *nearby_ids],
+            "participants": committed_participants,
+            "visible_to": committed_participants,
             "narration": narrative,
             "player_id": player_id,
             "player_input": clean_text(user_input),
@@ -5645,6 +10250,22 @@ prevented。只输出 JSON。
                 }
                 for item in npc_actions
                 if item.get("dialogue")
+            ]
+            + [
+                {
+                    "speaker_id": f"ambient_npc_{index}",
+                    "speaker_name": clean_text(
+                        reaction.get("speaker_label")
+                    )
+                    or "附近路人",
+                    "text": clean_text(reaction.get("dialogue")),
+                }
+                for index, reaction in enumerate(
+                    local_world.get("ambient_npc_reactions", []),
+                    start=1,
+                )
+                if isinstance(reaction, dict)
+                and clean_text(reaction.get("dialogue"))
             ],
             "player_intent": player_intent,
             "npc_agent_outputs": npc_actions,
@@ -5683,19 +10304,13 @@ prevented。只输出 JSON。
                 "resolved_actions", []
             ),
             "state_changes": state_changes,
-            "runtime_updates": self._runtime_updates(
-                player_id,
-                player_intent,
-                npc_actions,
-                local_world,
-                resolution,
-            ),
+            "runtime_updates": runtime_updates,
             "elapsed_minutes": elapsed_minutes,
             "duration_reason": clean_text(time_result.get("reason")),
             "clock_transition": self.store.clock_after_minutes(
                 elapsed_minutes
             ),
-            "backend_stage": "immersive_local_pipeline",
+            "backend_stage": "multi_agent_immersive_pipeline",
             "created_at": utc_now(),
         }
         global_trigger = bool(
@@ -5706,8 +10321,13 @@ prevented。只输出 JSON。
             or event["impact_level"] == "high_impact"
         )
         if global_trigger:
-            self._progress(progress_callback, 90, "大世界正在响应重大变化")
+            self._progress(progress_callback, 88, "大世界 Agent 正在响应重大变化")
+            stage_started = time.perf_counter()
             projection = self._world_project(event, context)
+            stage_seconds["global_world_llm"] = round(
+                time.perf_counter() - stage_started,
+                3,
+            )
             event["world_projection"] = projection
             event["backend_stage"] = "global_world_projection"
             event["state_changes"].extend(
@@ -5716,9 +10336,21 @@ prevented。只输出 JSON。
                 if isinstance(item, dict)
             )
         final_validation = self._event_validation(event, validations)
+        stage_started = time.perf_counter()
         commit = self.store.commit_event(event, final_validation)
-        self._progress(progress_callback, 96, "保存角色状态与世界进度")
+        self._progress(progress_callback, 94, "记忆记录 Agent 正在写入经历")
+        memory_summary_ran = bool(
+            self.memory_summary_interval
+            and self.store.branch["head_revision"]
+            % self.memory_summary_interval
+            == 0
+        )
         self._summarize_memories([player_profile, *profiles])
+        stage_seconds["commit_and_memory"] = round(
+            time.perf_counter() - stage_started,
+            3,
+        )
+        stage_seconds["total"] = round(time.perf_counter() - turn_started, 3)
         self._progress(progress_callback, 100, "本轮完成")
         return {
             "event": event,
@@ -5726,20 +10358,52 @@ prevented。只输出 JSON。
             "state_revision": self.store.branch["head_revision"],
             "branch_id": self.store.branch["branch_id"],
             "pipeline": {
+                "multi_agent_pipeline": True,
+                "planner_mode": "disabled_default",
+                "effective_scene_before_turn": turn_scene,
+                "active_scene_after_turn": runtime_updates.get(
+                    "active_scene", {}
+                ),
+                "pre_turn_location_inference": pre_location,
+                "promoted_ambient_npc_ids": promoted_ambient_ids,
                 "player_controller": player_intent,
                 "time_agent": time_result,
+                "agent_scheduler": wake_plan,
                 "nearby_npc_agents": npc_actions,
+                "sleeping_npc_agents": skipped_npc_actions,
+                "group_controller": group_controller,
+                "group_controller_ran": self._group_controller_ran(
+                    group_controller
+                ),
+                "npc_requires_world_or_gm": npc_requires_world_or_gm,
                 "local_world_agent": local_world,
+                "local_world_agent_ran": should_run_local_world,
+                "rules_agent": {
+                    "validation_count": len(validations),
+                    "statuses": [
+                        item.get("status") for item in validations
+                    ],
+                },
                 "gm_resolver": resolution,
+                "gm_resolver_ran": should_run_gm,
+                "event_scheduler": event_scheduler,
+                "memory_agent": {
+                    "event_memory_recorded": True,
+                    "summary_compaction_ran": memory_summary_ran,
+                    "visible_actor_count": len([player_profile, *profiles]),
+                },
                 "scene_renderer": {
                     "character_count": len(narrative),
                     "strict_first_person": True,
+                    "single_pass": False,
+                    "json_free_text": True,
                 },
                 "global_world_agent_ran": global_trigger,
                 "story_spine_after": self.store.runtime.get(
                     "narrative_spine", {}
                 ),
                 "rag_query_plan": context.get("query_plan", {}),
+                "stage_seconds": stage_seconds,
             },
             "internal_validation": {
                 "proposal_validations": validations,
